@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+*.log
+test_*.py
+tests/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Environment (use .env.example instead)
+.env
+
+# Test data and logs
+flask_*.log
+*.bat
+check_*.py
+debug_tools.py
+ingest_sample_logs.py
+setup_sandbox.py
+
+# Temporary files
+*.tmp
+*.bak

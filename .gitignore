@@ -1,0 +1,48 @@
+# Environment and secrets
+.env
+*.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.pyc
+
+# Generated/runtime data
+incidents.json
+data/firewall_sandbox/
+data/sentinelops_sandbox/
+data/chromadb_sentinelops/
+data/test_real_chromadb/
+data/pending_actions.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+logs/
+docker-compose.override.yml
+
+# Build artifacts (keep clean)
+*.egg-info/
+dist/
+build/

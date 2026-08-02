@@ -1,0 +1,184 @@
+"""SentinelOps CLI - Interactive multi-turn conversation interface"""
+import asyncio
+import os
+import json
+import sys
+from dotenv import load_dotenv
+from groq import Groq
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+load_dotenv()
+
+
+def convert_mcp_tools_to_groq_format(tools_resp):
+    """Convert MCP tool schema to OpenAI/Groq-compatible function calling format."""
+    tools = []
+    for t in tools_resp.tools:
+        params = t.inputSchema.copy() if t.inputSchema else {"type": "object", "properties": {}}
+        if "additionalProperties" not in params:
+            params["additionalProperties"] = False
+        tool = {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": params
+            }
+        }
+        tools.append(tool)
+    return tools
+
+
+async def run_cli():
+    """Run interactive CLI with multi-turn conversation history."""
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    if not client.api_key:
+        print("Error: GROQ_API_KEY not configured in .env file")
+        return
+    
+    print("="*70)
+    print("SentinelOps - Security Copilot CLI")
+    print("="*70)
+    print("Type 'exit' or 'quit' to end the session")
+    print("Type 'clear' to reset conversation history")
+    print("="*70)
+    
+    server_params = StdioServerParameters(command="python", args=["server.py"])
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            
+            # Get available tools from MCP server
+            tools_resp = await session.list_tools()
+            groq_tools = convert_mcp_tools_to_groq_format(tools_resp)
+            
+            # Initialize conversation history
+            messages = []
+            
+            while True:
+                # Get user input
+                try:
+                    user_input = input("\nYou: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n\nExiting...")
+                    break
+                
+                if not user_input:
+                    continue
+                
+                # Handle commands
+                if user_input.lower() in ('exit', 'quit'):
+                    print("Goodbye!")
+                    break
+                
+                if user_input.lower() == 'clear':
+                    messages = []
+                    print("Conversation history cleared.")
+                    continue
+                
+                # Add user message to history
+                messages.append({"role": "user", "content": user_input})
+                
+                try:
+                    # Process with agent - up to 10 turns for tool chaining
+                    for turn in range(10):
+                        response = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=messages,
+                            tools=groq_tools,
+                            max_tokens=1024
+                        )
+                        
+                        message = response.choices[0].message
+                        
+                        # Add assistant message to history
+                        messages.append({
+                            "role": "assistant",
+                            "content": message.content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                } for tc in message.tool_calls
+                            ] if message.tool_calls else None
+                        })
+                        
+                        # Handle tool calls
+                        if message.tool_calls:
+                            print(f"\n[Agent calling tools...]")
+                            tool_results = []
+                            
+                            for tool_call in message.tool_calls:
+                                tool_name = tool_call.function.name
+                                tool_args = json.loads(tool_call.function.arguments)
+                                
+                                print(f"  - {tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})")
+                                
+                                # CRITICAL GUARDRAIL: Human confirmation for execute_pending_action
+                                if tool_name == "execute_pending_action":
+                                    token = tool_args.get("token", "unknown")
+                                    
+                                    print("\n" + "WARNING: "*35)
+                                    print("DESTRUCTIVE ACTION REQUIRES CONFIRMATION")
+                                    print("WARNING: "*35)
+                                    print(f"Token: {token}")
+                                    print("-"*70)
+                                    
+                                    confirmation = input("Type 'yes' to execute, anything else to decline: ").strip()
+                                    
+                                    if confirmation.lower() == "yes":
+                                        print("APPROVED: Executing...")
+                                        result = await session.call_tool(tool_name, tool_args)
+                                        result_text = result.content[0].text
+                                        print(f"Result: {result_text}\n")
+                                        tool_results.append({
+                                            "role": "tool",
+                                            "tool_call_id": tool_call.id,
+                                            "content": result_text
+                                        })
+                                    else:
+                                        print("DECLINED: Action NOT executed.\n")
+                                        declined_msg = "Human user declined to execute this action."
+                                        tool_results.append({
+                                            "role": "tool",
+                                            "tool_call_id": tool_call.id,
+                                            "content": declined_msg
+                                        })
+                                else:
+                                    # Non-destructive tool - execute normally
+                                    result = await session.call_tool(tool_name, tool_args)
+                                    result_text = result.content[0].text
+                                    tool_results.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "content": result_text
+                                    })
+                            
+                            # Add tool results to history
+                            messages.extend(tool_results)
+                            
+                            # Continue to next turn for model to process results
+                            continue
+                        
+                        # No tool calls - print response and break
+                        if message.content:
+                            print(f"\nAgent: {message.content}")
+                        
+                        break
+                    
+                except Exception as e:
+                    if hasattr(e, 'status_code') and e.status_code == 429:
+                        print("\nWARNING: Rate limit exceeded. Please wait a moment.")
+                    else:
+                        print(f"\nERROR: {e}")
+
+
+if __name__ == "__main__":
+    print("\nStarting SentinelOps CLI...")
+    print("(Server startup may take ~30s for ChromaDB initialization)\n")
+    asyncio.run(run_cli())
