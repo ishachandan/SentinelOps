@@ -2,11 +2,10 @@
 
 ## Design Principles
 
-SentinelOps demonstrates three critical patterns for building safe LLM agents that interact with destructive operations:
+SentinelOps uses two safety layers for LLM agents that interact with destructive operations:
 
-1. **Evidence Chain Integrity** - Prevent AI hallucination in security decisions
-2. **Propose/Execute Split** - Separate AI planning from execution  
-3. **Multi-Gate Validation** - Defense in depth against bypasses
+1. **Evidence Integrity** - Bind high/critical incident claims to validated reputation evidence
+2. **Human-in-the-Loop Execution Gate** - Separate proposals from execution and enforce confirmation in Flask and MCP
 
 ---
 
@@ -34,13 +33,14 @@ If the agent then creates a high-severity incident about this IP, it **must** pr
 create_incident(
     summary="Malicious IP detected: 185.220.101.1",
     severity="high",
+    related_ip="185.220.101.1",
     evidence_token="f5bce9c4"  # REQUIRED
 )
 ```
 
 Server validation:
 ```python
-# 1. Token must exist in recent reputation checks
+# 1. Token must exist in this MCP process's reputation results
 if evidence_token not in REPUTATION_RESULTS:
     return {"error": "Invalid evidence_token"}
 
@@ -55,6 +55,12 @@ if not evidence["is_malicious"]:
 ```
 
 **Result:** Agent cannot fabricate high-severity incidents. It must provide proof it actually checked.
+
+The token is bound to the normalized IP and stored in MCP process memory. It is valid only in that process; each new MCP subprocess starts with no evidence tokens.
+
+## IP Address Validation
+
+SentinelOps parses IPv4 and IPv6 addresses with `ipaddress.ip_address` and uses their normalized form. `propose_block_ip` rejects loopback, unspecified, and multicast addresses; private, link-local, and documentation/test ranges remain valid targets. `check_ip_reputation` and `create_incident` validate syntax only. Firewall rule filenames use the normalized address with periods and colons replaced by underscores.
 
 ---
 
@@ -90,18 +96,20 @@ def propose_block_ip(ip: str, reason: str) -> str:
     save_pending_actions(PENDING_ACTIONS)  # Write to file
     return f"PREVIEW: Would block {ip}. Token: {token}\nAwaiting confirmation."
 
-# Phase 2: Execute (agent does NOT have access)
+# Phase 2: Execute (human-triggered by Flask after confirmation)
 def execute_pending_action(token: str) -> str:
-    # This function exists but is NEVER in the agent's tool list
-    action = PENDING_ACTIONS[token]
+    actions = load_pending_actions()
+    action = actions[token]
+    if action["status"] != "confirmed":
+        return "Error: action is not confirmed"
     if action["action_type"] == "block_ip":
         create_firewall_rule(action["ip"])
     action["status"] = "executed"
-    save_pending_actions(PENDING_ACTIONS)
+    save_pending_actions(actions)
     return "SUCCESS: Action executed"
 ```
 
-**Key insight:** `execute_pending_action` is never passed to the LLM. When Flask calls `run_agent_turn()` with `confirmation_callback=None`, any attempt by the agent to call this tool is automatically declined.
+**Key insight:** Human-only tool schemas are filtered out before the model sees them. `run_agent_turn()` rejects tool names outside its exposed set without calling MCP. MCP then re-reads the action file and executes only `status == "confirmed"`.
 
 Execution happens via a separate HTTP route:
 ```python
@@ -112,13 +120,11 @@ def confirm_action(token):
 ```
 
 **Why this works:**
-- Agent cannot call the execute tool (not in its tool list)
+- The model does not receive human-only tool schemas; agent-loop and CLI guards reject unexposed names.
 - Agent cannot POST to /confirm (different process, requires session cookie)
-- Even if token leaks, it's session-scoped and validated
+- Flask checks token existence, session ownership, and pending status, then writes `confirmed` before starting an MCP subprocess.
 
----
-
-## Pattern 3: Multi-Gate Validation
+### Flask and MCP confirmation gates (within layer 2)
 
 Even with human confirmation, Flask validates three separate gates:
 
@@ -138,11 +144,13 @@ def confirm_action(token):
     if pending['status'] != 'pending':
         return jsonify({"error": "Already resolved"}), 400
     
-    # All gates passed → execute
+    # All Flask gates passed: mark confirmed, then call MCP.
     execute_pending_action(token)
 ```
 
-**Defense layers:**
+The MCP server independently reloads `pending_actions.json` and refuses unknown, pending, declined, executed, and otherwise unconfirmed actions. Execution errors leave the status at `confirmed`.
+
+**Flask route responses:**
 - **404:** Prevents brute-force token guessing
 - **403:** Prevents cross-session hijacking
 - **400:** Prevents replay attacks
@@ -184,7 +192,7 @@ PENDING_ACTIONS_FILE = "data/pending_actions.json"
 # Uses identical load/save functions
 ```
 
-**Result:** No desynch possible. File is the single source of truth.
+**Result:** Both processes use the same persisted state instead of separate in-memory copies. The JSON file has no locking, so concurrent writes can still race.
 
 ---
 
@@ -201,8 +209,8 @@ PENDING_ACTIONS_FILE = "data/pending_actions.json"
 │                                                       │
 │ Step 1: Propose Phase                                │
 │ • Spawns MCP subprocess                              │
-│ • Agent gets tools: check_ip_reputation,            │
-│   propose_block_ip (NO execute_pending_action)      │
+│ • Human-only schemas filtered before model call     │
+│ • Agent loop rejects unexposed tool names           │
 └──────┬────────────────────────────────────────────┘
        │
        ↓
@@ -256,7 +264,7 @@ PENDING_ACTIONS_FILE = "data/pending_actions.json"
 └─────────────────────────────────────────────────────┘
 ```
 
-**Critical separation:** The agent process that *proposes* and the Flask route that *executes* are separate. The agent cannot bypass the human gate.
+**Critical separation:** Flask calls `execute_pending_action` only after a human POST passes the route checks. MCP independently reloads the state file and requires `status == "confirmed"` before execution.
 
 ---
 
@@ -265,7 +273,7 @@ PENDING_ACTIONS_FILE = "data/pending_actions.json"
 **What's protected:**
 ✅ Agent cannot execute destructive actions directly  
 ✅ Agent cannot fabricate high-severity incidents without evidence  
-✅ Tokens are session-scoped (no cross-user hijacking)  
+✅ Flask UI proposals are session-bound and checked against the current browser session
 ✅ Tokens are single-use (no replay attacks)  
 ✅ Execution requires human POST request (no LLM manipulation)  
 
@@ -283,7 +291,8 @@ data/
 ├── pending_actions.json     # Single source of truth
 ├── firewall_sandbox/        # Sandbox for "blocked" IPs
 ├── sentinelops_sandbox/     # Sandbox for "quarantined" files
-└── chromadb_sentinelops/    # Vector store (future feature)
+├── chromadb_sentinelops/    # Semantic log-search index when enabled
+└── action_log.jsonl         # Action audit events, including rejections
 
 server.py                    # MCP server, tool definitions
 web_ui.py                    # Flask web UI, confirmation routes
@@ -295,27 +304,42 @@ cli.py                       # Terminal interface
 
 ## Testing Strategy
 
-**Unit tests** (`tests/test_unit.py`):
-- Mock external APIs
-- Test evidence token validation
-- Test propose/execute separation
-- Fast (<5 seconds)
+Run the offline suite from the project root:
 
-**Integration tests** (`tests/test_integration.py`):
-- Full MCP subprocess
-- Real Groq API calls
-- Marked `@pytest.mark.integration`
-- Slow (~30 seconds)
+```powershell
+venv\Scripts\python.exe -m pytest -q
+```
 
-**Security gate tests** (`tests/test_security_gates.py`):
-- Requires Flask running on localhost:5000
-- Tests all bypass attempts
-- Validates 404/403/400 responses
+On POSIX, use `venv/bin/python -m pytest -q`. `pytest.ini` excludes `integration` tests by default, and `tests/conftest.py` keeps live-service/manual scripts out of collection. The offline suite includes unit/policy tests, hardening tests, and Flask `test_client()` confirmation-gate tests. The exact collected/passed/skipped counts are determined by the pytest output for the current checkout.
 
-**Docker tests** (`tests/test_docker_deployment.py`):
-- Smoke test after `docker compose up`
-- Validates health endpoint
-- Confirms volume mounts
+Verified in this checkout: **55 passed, 1 skipped, 2 deselected**. The two deselected tests are marked `integration`. The single skip is the combined symlink-containment test: even after Developer Mode was enabled, Windows returned `WinError 1314` when Python attempted to create a symlink.
+
+`tests/test_integration.py` is marked `integration`; it starts MCP subprocesses, and its LLM-chain test requires Groq credentials. Run it explicitly only when those dependencies are intended:
+
+```powershell
+venv\Scripts\python.exe -m pytest tests/test_integration.py -v -m integration
+```
+
+Live Flask wrappers (including `test_security_gates.py`, `test_security_direct.py`, and `test_web_ui.py`) and Docker smoke scripts are manual checks, not part of plain pytest collection. The five security-gate cases are covered offline by `tests/test_security_gate_routes.py`.
+
+---
+
+## Audit log and quarantine boundary
+
+`data/action_log.jsonl` stores one sanitized JSON object per line for action outcomes, including rejected evidence and blocked execution attempts. It is read from disk by `get_action_log`, which skips malformed lines; credential/token fields are omitted, configured secret values are redacted, and full message/file contents are not logged.
+
+Quarantine proposal and execution use `realpath` and `commonpath` containment checks against `data/sentinelops_sandbox/`. The sandbox root, quarantine subfolder, traversal paths, sibling-prefix paths, and symlinks resolving outside are rejected.
+
+## Known limitations (by design for this demo)
+
+- JSON-file storage has no locking; concurrent writes can race.
+- Flask starts a new MCP subprocess per request, so evidence tokens and other MCP in-memory state do not survive across requests.
+- Conversation history is stored in the Flask cookie session.
+- `/confirm` and `/decline` do not have CSRF protection.
+- Generated action and evidence tokens are 8 hexadecimal characters.
+- The Flask secret key is random per restart unless `FLASK_SECRET_KEY` is configured.
+- Execution is sandbox-only; no real firewall or out-of-sandbox quarantine operation occurs.
+- Prompt injection through log content is bounded by the confirmation gate but can still influence the preview shown to a human.
 
 ---
 
@@ -580,9 +604,11 @@ sentinelops/
 │
 ├── Data (persistent volume)
 │   └── data/
-│       ├── pending_actions.json      # Single source of truth
-│       ├── firewall_sandbox/         # Executed firewall rules
-│       └── chromadb/                 # Vector storage
+│   ├── pending_actions.json      # Single source of truth
+│   ├── action_log.jsonl          # Append-only JSON Lines audit events
+│   ├── firewall_sandbox/         # Executed firewall rules
+│   ├── sentinelops_sandbox/      # Input files and quarantine subfolder
+│   └── chromadb_sentinelops/     # Semantic log-search index when enabled
 │
 ├── Docker
 │   ├── Dockerfile          # Container definition
@@ -602,6 +628,8 @@ sentinelops/
 ```
 
 ## State Management
+
+`pending_actions.json` and `action_log.jsonl` are file-based and are not protected by file locking. `REPUTATION_RESULTS` (evidence tokens) lives only in MCP process memory.
 
 ### Session State (in-memory)
 ```python
@@ -650,7 +678,7 @@ flask_session['conversations'][session_id] = [
 | Protocol | MCP 1.3.2 | Tool integration |
 | Threat Intel | AbuseIPDB | IP reputation |
 | Notifications | Telegram | Alerts |
-| Vector DB | ChromaDB 0.6.2 | Future use |
+| Vector DB | ChromaDB 0.6.2 | Semantic log search with `USE_REAL_APIS=true`; stub fallback otherwise |
 | Container | Docker | Deployment |
 | Orchestration | Docker Compose | Multi-service |
 

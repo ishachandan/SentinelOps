@@ -33,7 +33,7 @@ SAMPLE_LOGS = [
     # Data exfiltration
     "2024-01-15 15:45:12 Large data transfer detected: 500MB uploaded to external IP 45.33.22.11",
     "2024-01-15 15:46:00 Suspicious database query from user 'admin': SELECT * FROM users WHERE 1=1",
-    "2024-01-15 15:47:20 Unauthorized access to /etc/passwd from 45.33.22.11",
+    "2024-01-15 15:47:20 Unauthorized access to data/sentinelops_sandbox/system_config.txt from 45.33.22.11",
     
     # Privilege escalation
     "2024-01-15 16:10:45 Sudo privilege escalation attempt by user 'guest'",
@@ -193,4 +193,3 @@ def ingest_logs():
 
 if __name__ == "__main__":
     ingest_logs()
-

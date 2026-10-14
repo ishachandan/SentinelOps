@@ -2,32 +2,39 @@
 import asyncio
 import os
 import json
+import re
 import sys
 from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from agent_shared import HUMAN_ONLY_TOOLS, convert_mcp_tools_to_groq_format
 
 load_dotenv()
 
 
-def convert_mcp_tools_to_groq_format(tools_resp):
-    """Convert MCP tool schema to OpenAI/Groq-compatible function calling format."""
-    tools = []
-    for t in tools_resp.tools:
-        params = t.inputSchema.copy() if t.inputSchema else {"type": "object", "properties": {}}
-        if "additionalProperties" not in params:
-            params["additionalProperties"] = False
-        tool = {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": params
-            }
-        }
-        tools.append(tool)
-    return tools
+def update_pending_action_status(token: str, status: str):
+    """Update an action's human resolution in the shared file."""
+    pending_file = os.path.join("data", "pending_actions.json")
+    try:
+        with open(pending_file, "r", encoding="utf-8") as f:
+            actions = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+    if token not in actions:
+        return False
+
+    actions[token]["status"] = status
+    actions[token][f"{status}_at"] = __import__("datetime").datetime.now().isoformat()
+    with open(pending_file, "w", encoding="utf-8") as f:
+        json.dump(actions, f, indent=2)
+    return True
+
+
+def mark_pending_action_confirmed(token: str):
+    """Mark a pending action as confirmed in the shared file."""
+    return update_pending_action_status(token, "confirmed")
 
 
 async def run_cli():
@@ -51,7 +58,7 @@ async def run_cli():
             
             # Get available tools from MCP server
             tools_resp = await session.list_tools()
-            groq_tools = convert_mcp_tools_to_groq_format(tools_resp)
+            groq_tools = convert_mcp_tools_to_groq_format(tools_resp, exclude=HUMAN_ONLY_TOOLS)
             
             # Initialize conversation history
             messages = []
@@ -116,31 +123,51 @@ async def run_cli():
                             for tool_call in message.tool_calls:
                                 tool_name = tool_call.function.name
                                 tool_args = json.loads(tool_call.function.arguments)
+
+                                exposed_tool_names = {
+                                    tool["function"]["name"] for tool in groq_tools
+                                }
+                                if tool_name not in exposed_tool_names:
+                                    tool_results.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "content": "Tool not available"
+                                    })
+                                    continue
                                 
                                 print(f"  - {tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})")
                                 
                                 # CRITICAL GUARDRAIL: Human confirmation for execute_pending_action
                                 if tool_name == "execute_pending_action":
                                     token = tool_args.get("token", "unknown")
-                                    
+
                                     print("\n" + "WARNING: "*35)
                                     print("DESTRUCTIVE ACTION REQUIRES CONFIRMATION")
                                     print("WARNING: "*35)
                                     print(f"Token: {token}")
                                     print("-"*70)
-                                    
+
                                     confirmation = input("Type 'yes' to execute, anything else to decline: ").strip()
-                                    
+
                                     if confirmation.lower() == "yes":
                                         print("APPROVED: Executing...")
-                                        result = await session.call_tool(tool_name, tool_args)
-                                        result_text = result.content[0].text
-                                        print(f"Result: {result_text}\n")
-                                        tool_results.append({
-                                            "role": "tool",
-                                            "tool_call_id": tool_call.id,
-                                            "content": result_text
-                                        })
+                                        if mark_pending_action_confirmed(token):
+                                            result = await session.call_tool(tool_name, tool_args)
+                                            result_text = result.content[0].text
+                                            print(f"Result: {result_text}\n")
+                                            tool_results.append({
+                                                "role": "tool",
+                                                "tool_call_id": tool_call.id,
+                                                "content": result_text
+                                            })
+                                        else:
+                                            result_text = "Error: Token not found or already resolved."
+                                            print(f"Result: {result_text}\n")
+                                            tool_results.append({
+                                                "role": "tool",
+                                                "tool_call_id": tool_call.id,
+                                                "content": result_text
+                                            })
                                     else:
                                         print("DECLINED: Action NOT executed.\n")
                                         declined_msg = "Human user declined to execute this action."
@@ -150,9 +177,43 @@ async def run_cli():
                                             "content": declined_msg
                                         })
                                 else:
-                                    # Non-destructive tool - execute normally
                                     result = await session.call_tool(tool_name, tool_args)
                                     result_text = result.content[0].text
+
+                                    if tool_name.startswith("propose_") and "PREVIEW" in result_text:
+                                        token_match = re.search(
+                                            r"[Tt]oken:\s*([a-f0-9]+)", result_text
+                                        )
+                                        if token_match:
+                                            token = token_match.group(1)
+                                            print(f"Preview: {result_text}")
+                                            confirmation = input(
+                                                "Type 'y' to execute, anything else to decline: "
+                                            ).strip().lower()
+                                            if confirmation in ("y", "yes"):
+                                                if mark_pending_action_confirmed(token):
+                                                    execution = await session.call_tool(
+                                                        "execute_pending_action",
+                                                        {"token": token},
+                                                    )
+                                                    result_text = execution.content[0].text
+                                                    print(f"Result: {result_text}\n")
+                                                else:
+                                                    result_text = (
+                                                        "Error: Token not found or already resolved."
+                                                    )
+                                            else:
+                                                if update_pending_action_status(token, "declined"):
+                                                    result_text = (
+                                                        "Human user declined to execute this action."
+                                                    )
+                                                    print("DECLINED: Action NOT executed.\n")
+                                                else:
+                                                    result_text = (
+                                                        "Error: Token not found or already resolved."
+                                                    )
+                                                    print(f"Result: {result_text}\n")
+
                                     tool_results.append({
                                         "role": "tool",
                                         "tool_call_id": tool_call.id,

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from agent_shared import convert_mcp_tools_to_groq_format, run_agent_turn
+from agent_shared import HUMAN_ONLY_TOOLS, convert_mcp_tools_to_groq_format, run_agent_turn
 
 load_dotenv()
 
@@ -18,6 +18,24 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
 
 # Feature flag for debug endpoints (MUST be explicitly enabled)
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").lower() in ("true", "1", "yes")
+
+
+def is_flask_debug_enabled():
+    """Return whether Flask debug mode is explicitly enabled."""
+    return os.getenv("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
+
+
+def mcp_server_parameters():
+    """Pass runtime feature flags to MCP without copying application secrets."""
+    server_env = {
+        key: os.environ[key]
+        for key in ("USE_REAL_APIS", "ENABLE_DEBUG_ENDPOINTS")
+        if key in os.environ
+    }
+    return StdioServerParameters(
+        command="python", args=["server.py"], env=server_env
+    )
+
 
 # SINGLE SOURCE OF TRUTH: File-based storage shared with MCP
 # This is the SAME file that MCP server.py reads/writes
@@ -130,13 +148,13 @@ def send_message():
             try:
                 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
                 
-                server_params = StdioServerParameters(command="python", args=["server.py"])
+                server_params = mcp_server_parameters()
                 async with stdio_client(server_params) as (read, write):
                     async with ClientSession(read, write) as mcp_session:
                         await mcp_session.initialize()
                         
                         tools_resp = await mcp_session.list_tools()
-                        groq_tools = convert_mcp_tools_to_groq_format(tools_resp)
+                        groq_tools = convert_mcp_tools_to_groq_format(tools_resp, exclude=HUMAN_ONLY_TOOLS)
                         
                         # Run agent with NO confirmation callback (Step 1: skip execute_pending_action)
                         updated_messages, final_response = await run_agent_turn(
@@ -353,7 +371,7 @@ def confirm_action(token):
         asyncio.set_event_loop(loop)
         
         async def execute():
-            server_params = StdioServerParameters(command="python", args=["server.py"])
+            server_params = mcp_server_parameters()
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as mcp_session:
                     await mcp_session.initialize()
@@ -453,7 +471,7 @@ def debug_seed_token():
         "token": "testABC1" (optional, auto-generated if not provided),
         "action_type": "block_ip" (required),
         "ip": "1.2.3.4" (required for block_ip),
-        "path": "/tmp/test.exe" (required for quarantine_file),
+        "path": "data/sentinelops_sandbox/test.exe" (required for quarantine_file),
         "reason": "Test reason" (optional),
         "status": "pending" (optional, defaults to pending),
         "use_session_id": "custom-session" (optional, defaults to current session)
@@ -483,7 +501,7 @@ def debug_seed_token():
         
         # Build pending action record matching MCP's schema
         ip = data.get('ip', '1.2.3.4')
-        path = data.get('path', '/tmp/test.exe')
+        path = data.get('path', os.path.join("data", "sentinelops_sandbox", "test.exe"))
         reason = data.get('reason', 'Test action')
         status = data.get('status', 'pending')
         
@@ -491,7 +509,7 @@ def debug_seed_token():
         if action_type == 'block_ip' and not data.get('ip'):
             ip = '1.2.3.4'  # Default test IP
         elif action_type == 'quarantine_file' and not data.get('path'):
-            path = '/tmp/test.exe'  # Default test path
+            path = os.path.join("data", "sentinelops_sandbox", "test.exe")
         elif action_type not in ['block_ip', 'quarantine_file']:
             return jsonify({'error': f'Unknown action_type: {action_type}'}), 400
         
@@ -542,4 +560,4 @@ if __name__ == '__main__':
     print("          on first request. Subsequent requests will be faster.")
     print("=" * 70)
     print("\nOpen http://localhost:5000 in your browser\n")
-    app.run(debug=True, port=5000, use_reloader=False)
+    app.run(debug=is_flask_debug_enabled(), port=5000, use_reloader=False)
