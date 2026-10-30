@@ -37,8 +37,6 @@ flask_*.log
 *.bat
 check_*.py
 debug_tools.py
-ingest_sample_logs.py
-setup_sandbox.py
 
 # Temporary files
 *.tmp

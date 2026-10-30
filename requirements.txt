@@ -7,6 +7,10 @@ requests==2.32.3
 # MCP (Model Context Protocol) - using latest 1.x version
 mcp==1.29.0
 
+# Optional semantic log search (ChromaDB)
+chromadb==0.6.2
+sentence-transformers==3.4.1
+
 # Testing (optional, for development)
 pytest==8.3.4
 pytest-asyncio==0.25.2
