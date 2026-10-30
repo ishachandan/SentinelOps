@@ -6,65 +6,86 @@
 
 ## Architecture
 
+### System Component & Evidence-Token Architecture
+
 ```
-                                  +------------------------------------+
-                                  |         OPERATOR (BROWSER)         |
-                                  |    Investigates threats in UI      |
-                                  |    Reviews preview & params_hash   |
-                                  |    Clicks [Confirm] / [Decline]    |
-                                  +-----------------+------------------+
-                                                    |
-                                    HTTP POST /send | POST /confirm/<token>
-                                                    v
-                                  +------------------------------------+
-                                  |         FLASK WEB GATEWAY          |
-                                  |    3 Route Gates:                  |
-                                  |      Gate 1: Token Exists (404)    |
-                                  |      Gate 2: Session Match (404)   |
-                                  |      Gate 3: State Pending (409)   |
-                                  |    params_hash re-validation       |
-                                  +--------+------------------+--------+
-                                           |                  |
-                          1. Agent Query   |                  | 4. Execute Confirmed Action
-                                           v                  v
-+-------------------------------+  +---------------+  +-------------------------------+
-|      FAST-MCP SERVER          |  |  GROQ AGENT   |  |      FAST-MCP SERVER          |
-|  - search_logs (<untrusted>)  |  |  (LLaMA 3.3)  |  |  execute_pending_action       |
-|  - check_ip_reputation        |->|  Proposes     |  |  - Re-verifies params_hash    |
-|  - propose_block_ip           |  |  actions only |  |  - Re-checks allowlist        |
-|  - propose_quarantine_file    |  |  NO execute   |  |  - Executes sandbox rule      |
-+---------------+---------------+  +-------+-------+  +---------------+---------------+
-                |                          |                          |
-                +--------------------------+--------------------------+
-                                           |
-                                           v
-                        +-------------------------------------+
-                        |         POLICY ENGINE LAYER         |
-                        |  - Delimiter Sanitization (<data>)  |
-                        |  - Structured IP Observation Only   |
-                        |  - Suspicious Event Log Evidence    |
-                        |  - Fail-Closed Protected Allowlist  |
-                        |  - Server-Derived Action Severity   |
-                        |  - Cryptographic params_hash (SHA)  |
-                        +------------------+------------------+
-                                           |
-                                           v
-                        +-------------------------------------+
-                        |     ATOMIC SQLITE WAL STORE         |
-                        |  - pending -> confirmed -> executed |
-                        |  - params_hash, severity, approvals |
-                        |  - audit_head (last_seq, head_hash) |
-                        +------------------+------------------+
-                                           |
-                                           v
-                        +-------------------------------------+
-                        |   TAMPER-EVIDENT AUDIT CHAIN        |
-                        |  - action_log.jsonl (SHA-256 chain) |
-                        |  - Genesis prev_hash: '0' * 64      |
-                        |  - OS-locked atomic appends         |
-                        |  - SQLite audit_head sync           |
-                        +-------------------------------------+
+   +----------------------------------------------------------------------------------------------------+
+   |                                      INVESTIGATION & REASONING                                     |
+   |                                                                                                    |
+   |    +-----------------------------+      Prompt & Tools     +----------------------------------+    |
+   |    |    GROQ LLM (LLaMA 3.3)     |<=======================>|         FAST-MCP SERVER          |    |
+   |    |  - Autonomous Reasoning     |                         |  - Schema Filter (Read/Propose)  |    |
+   |    |  - Cannot execute actions   |                         |  - Session Context Management    |    |
+   |    |  - Passes evidence_token    |                         +-----+----------------------+-----+    |
+   |    +-----------------------------+                               |                      |          |
+   +------------------------------------------------------------------|----------------------|----------+
+                                                                      |                      |
+            1. search_logs(query)                                     |                      | 2. check_ip_reputation(ip)
+                                  v                                   v                      v
+        +-----------------------------------------------+   +-----------------------------------------------+
+        |             CHROMADB VECTOR STORE             |   |            ABUSEIPDB THREAT INTEL             |
+        |  - Embeddings: all-MiniLM-L6-v2 ONNX          |   |  - Real-time abuse confidence score (0-100)   |
+        |  - Ingests & indexes security audit telemetry |   |  - Score >= 50 flagged malicious              |
+        |  - Raw logs returned in <untrusted_data> tag  |   |  - Mints session-bound evidence_token         |
+        |  - Structured source_ip -> observed_ips table |   +-----------------------+-----------------------+
+        +-----------------------+-----------------------+                           |
+                                |                                                   | Returns evidence_token
+                                | Structured IPs & Suspicious Events                | & reputation score
+                                +-------------------------+-------------------------+
+                                                          |
+                                                          v
+                                        +-----------------------------------+
+                                        |        POLICY ENGINE CHECK        |
+                                        |  [propose_block_ip/create_inc]    |
+                                        |  * Target IP in observed_ips?     |
+                                        |  * Valid evidence_token supplied? |
+                                        |  * Target IP in Protected List?   |
+                                        |  * Derive severity & approvals    |
+                                        +-----------------+-----------------+
+                                                          |
+                                                          | PASS: Generates action token & params_hash
+                                                          v
+                                        +-----------------------------------+
+                                        |      ATOMIC SQLITE WAL STORE      |
+                                        |  - Stored: pending proposal       |
+                                        |  - Cryptographic params_hash      |
+                                        |  - Severity: Critical (2 approvals|
+                                        |  - audit_head (last_seq, head)    |
+                                        +-----------------+-----------------+
+                                                          |
+   +------------------------------------------------------|---------------------------------------------+
+   |                                      HUMAN-IN-THE-LOOP APPROVAL                                    |
+   |                                                      v                                             |
+   |    +-----------------------------+       HTTP POST /confirm/<token>    +----------------------+    |
+   |    |     OPERATOR (BROWSER)      |------------------------------------>|  FLASK WEB GATEWAY   |    |
+   |    |  - Reviews IP, Reason, Hash |                                     |  - 3 Route Gates     |    |
+   |    |  - Confirms action          |                                     |  - params_hash check |    |
+   |    +-----------------------------+                                     +----------+-----------+    |
+   |                                                                                   |                |
+   |                                  4. execute_pending_action(token, hash)           v                |
+   |                                  (Human-Only Tool: Hidden from LLM)    +----------------------+    |
+   |                                                                        |   FIREWALL SANDBOX   |    |
+   |                                                                        |   & AUDIT CHAIN      |    |
+   |                                                                        | - iptables rule file |    |
+   |                                                                        | - SHA-256 log chain  |    |
+   |                                                                        +----------------------+    |
+   +----------------------------------------------------------------------------------------------------+
 ```
+
+### Component Interaction Summary
+
+1. **Groq LLaMA 3.3 (Autonomous Copilot)**: Drives threat reasoning and investigations through tool calling. Destructive tools (`execute_pending_action`, `expire_blocks`) are removed from its tool schema (`HUMAN_ONLY_TOOLS`), guaranteeing that the LLM cannot directly apply firewall rules or alter defensive configurations.
+2. **ChromaDB (Vector Log Search & Prompt Injection Defense)**: Indexes security telemetry with ONNX `all-MiniLM-L6-v2`. Raw log lines returned to the LLM are sanitized and isolated in `<untrusted_data>` delimiters to defeat indirect prompt injections. FastMCP extracts only structured metadata fields (`source_ip`, `client_ip`) and records them into the SQLite `observed_ips` policy table.
+3. **FastMCP Server (Tool Gateway & Human Gatekeeper)**: Enforces input validation, manages session contexts, interfaces with AbuseIPDB, and restricts destructive actions exclusively to human operator routes.
+4. **Evidence-Token Check (Anti-Hallucination & Provenance Verification)**:
+   - When the agent calls `check_ip_reputation(ip)`, FastMCP queries AbuseIPDB and mints an authenticated `result_token` (stored in SQLite `evidence` table).
+   - High/critical escalations (`create_incident`, `notify_telegram`) and mitigations (`propose_block_ip`) require this `evidence_token`.
+   - The Policy Engine validates that:
+     1. The token exists and belongs to the active session.
+     2. The token is cryptographically bound to the target IP being acted on.
+     3. Telemetry confirms a malicious threshold (score $\ge 50$ or confirmed high-threat log event).
+     4. Target is not in the fail-closed protected allowlist (`data/protected.yaml`).
+   - Hallucinated targets or prompt-injected victim IPs (e.g. `10.0.0.1`) fail closed immediately with `policy_denied:unobserved_ip` or `missing_evidence_token`.
 
 ---
 
