@@ -15,8 +15,8 @@ services:
       - USE_REAL_APIS=true
       - ENABLE_DEBUG_ENDPOINTS=false
     volumes:
-      # Persist data directories
-      - ./data:/app/data
+      # SQLite WAL needs local storage shared by Flask and its MCP subprocess.
+      - sentinelops-data:/app/data
       # Optional: Mount logs for debugging
       - ./logs:/app/logs
     restart: unless-stopped
@@ -32,3 +32,6 @@ services:
 networks:
   sentinelops-network:
     driver: bridge
+
+volumes:
+  sentinelops-data:

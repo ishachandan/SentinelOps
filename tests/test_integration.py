@@ -75,7 +75,7 @@ async def test_full_agent_chain_with_llm(mock_get):
             
             for turn in range(10):
                 response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
                     messages=messages,
                     tools=groq_tools,
                     max_tokens=1024

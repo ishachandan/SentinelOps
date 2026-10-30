@@ -1,10 +1,12 @@
 """Flask Web UI for SentinelOps - Server-side confirmation enforcement"""
 import asyncio
 import os
+import sys
 import json
 import uuid
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, session as flask_session
+from flask import Flask, render_template, request, jsonify, session as flask_session, has_request_context
+import store
 from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
@@ -25,49 +27,20 @@ def is_flask_debug_enabled():
     return os.getenv("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
 
 
-def mcp_server_parameters():
-    """Pass runtime feature flags to MCP without copying application secrets."""
+def mcp_server_parameters(session_id=None):
+    """Pass runtime feature flags and session context to MCP."""
     server_env = {
         key: os.environ[key]
-        for key in ("USE_REAL_APIS", "ENABLE_DEBUG_ENDPOINTS")
+        for key in ("USE_REAL_APIS", "ENABLE_DEBUG_ENDPOINTS", "SENTINELOPS_DB_PATH")
         if key in os.environ
     }
+    if session_id:
+        server_env["SENTINELOPS_SESSION_ID"] = session_id
+    elif has_request_context() and 'session_id' in flask_session:
+        server_env["SENTINELOPS_SESSION_ID"] = flask_session['session_id']
     return StdioServerParameters(
-        command="python", args=["server.py"], env=server_env
+        command=sys.executable, args=["server.py"], env=server_env
     )
-
-
-# SINGLE SOURCE OF TRUTH: File-based storage shared with MCP
-# This is the SAME file that MCP server.py reads/writes
-PENDING_ACTIONS_FILE = "data/pending_actions.json"
-
-def load_pending_actions():
-    """Load pending actions from file - single source of truth"""
-    try:
-        with open(PENDING_ACTIONS_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_pending_actions(actions):
-    """Save pending actions to file - single source of truth"""
-    os.makedirs(os.path.dirname(PENDING_ACTIONS_FILE), exist_ok=True)
-    with open(PENDING_ACTIONS_FILE, 'w') as f:
-        json.dump(actions, f, indent=2)
-
-def get_pending_action(token):
-    """Get a single pending action by token"""
-    actions = load_pending_actions()
-    return actions.get(token)
-
-def update_pending_action(token, updates):
-    """Update a pending action's fields"""
-    actions = load_pending_actions()
-    if token in actions:
-        actions[token].update(updates)
-        save_pending_actions(actions)
-        return True
-    return False
 
 
 def get_session_id():
@@ -292,23 +265,20 @@ def build_transcript_entries(old_message_count, new_messages, user_message, sess
             
             # Check if this is a propose_* result with a token (Step 2 detection)
             if 'Token:' in content and 'PREVIEW' in content:
-                # Extract token
+                # Extract token and params hash
                 import re
                 match = re.search(r'[Tt]oken:\s*([a-f0-9]+)', content)
+                hash_match = re.search(r'Params Hash:\s*([a-f0-9]+)', content)
+                params_hash_short = hash_match.group(1) if hash_match else ""
+
                 if match:
                     token = match.group(1)
-                    
-                    # Update the existing pending action in the file (single source of truth)
-                    # MCP already created it, we just add Flask-specific metadata
-                    update_pending_action(token, {
-                        'session_id': session_id,
-                        'preview_text': content
-                    })
                     
                     transcript_entries.append({
                         'type': 'pending_confirmation',
                         'content': content,
                         'token': token,
+                        'params_hash': params_hash_short,
                         'timestamp': datetime.now().isoformat()
                     })
                 else:
@@ -338,40 +308,79 @@ def confirm_action(token):
     try:
         session_id = get_session_id()
         
-        # CRITICAL VALIDATION: Check token exists in file (single source of truth)
-        pending = get_pending_action(token)
-        if not pending:
+        # CRITICAL VALIDATION: Check token exists in store
+        pending = store.get_action(token)
+        if not pending or pending.get('session_id') != session_id:
             return jsonify({
                 'success': False,
                 'error': 'Invalid or unknown token. Action not found.'
             }), 404
-        
-        # CRITICAL VALIDATION: Check token belongs to this session
-        if pending.get('session_id') != session_id:
-            return jsonify({
-                'success': False,
-                'error': 'Token does not belong to your session.'
-            }), 403
-        
+
+        # Parameter binding verification: check hash if provided by client/UI
+        data = request.get_json(silent=True) or {}
+        provided_hash = (
+            request.args.get('hash')
+            or request.args.get('params_hash')
+            or data.get('params_hash')
+            or data.get('hash')
+        )
+        if provided_hash:
+            stored_hash = pending.get('params_hash', '')
+            match = (
+                stored_hash == provided_hash
+                or stored_hash.startswith(provided_hash)
+                or (len(provided_hash) >= 8 and stored_hash[:8] == provided_hash[:8])
+            )
+            if not match:
+                import audit_chain
+                audit_chain.append_audit_entry({
+                    "action": "confirm_action",
+                    "status": "refused",
+                    "reason": "refusal:params_hash_mismatch",
+                    "token": token,
+                    "details": {"provided_hash": provided_hash, "stored_hash": stored_hash}
+                })
+                return jsonify({
+                    'success': False,
+                    'error': 'Parameter binding verification failed: params_hash mismatch.'
+                }), 400
+
         # CRITICAL VALIDATION: Check token not already resolved
-        if pending.get('status') != 'pending':
+        if pending.get('status') not in ('pending', 'partially_approved'):
             return jsonify({
                 'success': False,
                 'error': f"Action already {pending['status']}. Cannot execute again."
-            }), 400
-        
-        # Mark as confirmed BEFORE executing (write to single source of truth)
-        update_pending_action(token, {
-            'status': 'confirmed',
-            'confirmed_at': datetime.now().isoformat()
-        })
+            }), 409
+
+        # Severity tier check: critical actions require two distinct confirmations
+        # TODO (Step 8): Replace X-Operator-ID header with authenticated sessions / JWT tokens
+        severity = str(pending.get('severity', 'medium')).lower()
+        if severity == 'critical':
+            approver_id = request.headers.get("X-Operator-ID") or data.get("operator_id") or session_id
+            success, msg, updated = store.record_approval(token, session_id, approver_id)
+            if not success:
+                return jsonify({'success': False, 'error': msg}), 409
+            if updated and updated['status'] == 'partially_approved':
+                return jsonify({
+                    'success': True,
+                    'status': 'partially_approved',
+                    'message': 'First approval recorded. Critical action requires confirmation from a second distinct operator.'
+                }), 202
+
+        else:
+            # Mark as confirmed BEFORE executing via transition()
+            if not store.transition(token, session_id, frm='pending', to='confirmed'):
+                return jsonify({
+                    'success': False,
+                    'error': 'Action could not be confirmed (may be expired or already resolved).'
+                }), 409
         
         # NOW execute the action via MCP
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         async def execute():
-            server_params = mcp_server_parameters()
+            server_params = mcp_server_parameters(session_id=session_id)
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as mcp_session:
                     await mcp_session.initialize()
@@ -381,14 +390,14 @@ def confirm_action(token):
         result_text = loop.run_until_complete(execute())
         loop.close()
         
-        # MCP's execute_pending_action updates status to 'executed' in the file
-        # No need to update here - single source of truth is maintained by MCP
-        
+        final = store.get_action(token)
+        status_code = 200 if final and final.get('status') == 'executed' else 500
         return jsonify({
-            'success': True,
+            'success': status_code == 200,
             'result': result_text,
+            'status': final.get('status') if final else 'unknown',
             'timestamp': datetime.now().isoformat()
-        })
+        }), status_code
         
     except Exception as e:
         import traceback
@@ -405,33 +414,27 @@ def decline_action(token):
     try:
         session_id = get_session_id()
         
-        # Validate token exists (read from single source of truth)
-        pending = get_pending_action(token)
-        if not pending:
+        # Validate token exists in store
+        pending = store.get_action(token)
+        if not pending or pending.get('session_id') != session_id:
             return jsonify({
                 'success': False,
                 'error': 'Invalid or unknown token.'
             }), 404
-        
-        # Validate session
-        if pending.get('session_id') != session_id:
-            return jsonify({
-                'success': False,
-                'error': 'Token does not belong to your session.'
-            }), 403
         
         # Validate not already resolved
         if pending.get('status') != 'pending':
             return jsonify({
                 'success': False,
                 'error': f"Action already {pending['status']}."
-            }), 400
+            }), 409
         
-        # Mark as declined in the file (single source of truth) - NO execution
-        update_pending_action(token, {
-            'status': 'declined',
-            'declined_at': datetime.now().isoformat()
-        })
+        # Mark as declined via transition() - NO execution
+        if not store.transition(token, session_id, frm='pending', to='declined'):
+            return jsonify({
+                'success': False,
+                'error': 'Action could not be declined.'
+            }), 409
         
         return jsonify({
             'success': True,
@@ -462,22 +465,7 @@ def debug_seed_token():
     
     SECURITY: Only available when ENABLE_DEBUG_ENDPOINTS=true in environment.
     This bypasses the LLM/agent completely - used for security gate testing.
-    
-    Writes directly to the single source of truth (pending_actions.json file).
-    No subprocess spawning, no MCP client - just direct file manipulation.
-    
-    POST body:
-    {
-        "token": "testABC1" (optional, auto-generated if not provided),
-        "action_type": "block_ip" (required),
-        "ip": "1.2.3.4" (required for block_ip),
-        "path": "data/sentinelops_sandbox/test.exe" (required for quarantine_file),
-        "reason": "Test reason" (optional),
-        "status": "pending" (optional, defaults to pending),
-        "use_session_id": "custom-session" (optional, defaults to current session)
-    }
     """
-    # SECURITY GATE: Check if debug endpoints are enabled
     if not ENABLE_DEBUG_ENDPOINTS:
         return jsonify({
             'error': 'Debug endpoints are disabled. Set ENABLE_DEBUG_ENDPOINTS=true to enable.'
@@ -485,71 +473,51 @@ def debug_seed_token():
     try:
         data = request.get_json()
         
-        # Get or generate token
         token = data.get('token', str(uuid.uuid4())[:8])
-        
-        # Get action details
         action_type = data.get('action_type')
         if not action_type:
             return jsonify({'error': 'action_type is required'}), 400
         
-        # Determine session_id
         if 'use_session_id' in data:
             session_id = data['use_session_id']
         else:
             session_id = get_session_id()
         
-        # Build pending action record matching MCP's schema
         ip = data.get('ip', '1.2.3.4')
         path = data.get('path', os.path.join("data", "sentinelops_sandbox", "test.exe"))
         reason = data.get('reason', 'Test action')
         status = data.get('status', 'pending')
         
-        # Validate action-specific fields
-        if action_type == 'block_ip' and not data.get('ip'):
-            ip = '1.2.3.4'  # Default test IP
-        elif action_type == 'quarantine_file' and not data.get('path'):
-            path = os.path.join("data", "sentinelops_sandbox", "test.exe")
-        elif action_type not in ['block_ip', 'quarantine_file']:
+        if action_type == 'block_ip':
+            params = {'ip': ip, 'reason': reason}
+        elif action_type == 'quarantine_file':
+            params = {'path': path, 'reason': reason}
+        else:
             return jsonify({'error': f'Unknown action_type: {action_type}'}), 400
         
-        # Construct the action record (matching MCP's schema)
-        action_record = {
-            'action_type': action_type,
-            'reason': reason,
-            'status': status,
-            'created_at': datetime.now().isoformat(),
-            'session_id': session_id,  # Flask-specific field for session validation
-            'debug_seed': True
-        }
-        
-        # Add action-specific fields
-        if action_type == 'block_ip':
-            action_record['ip'] = ip
-            preview_text = f"PREVIEW: Would block IP {ip}. Reason: {reason}\nToken: {token}\nAwaiting human confirmation."
-        elif action_type == 'quarantine_file':
-            action_record['path'] = path
-            preview_text = f"PREVIEW: Would quarantine file: {path}. Reason: {reason}\nToken: {token}\nAwaiting human confirmation."
-        
-        action_record['preview_text'] = preview_text
-        
-        # Write directly to the single source of truth (pending_actions.json)
-        actions = load_pending_actions()
-        actions[token] = action_record
-        save_pending_actions(actions)
+        store.create_action(token, session_id, action_type, params, status='pending')
+        if status != 'pending':
+            if status in ('confirmed', 'declined', 'expired'):
+                store.transition(token, session_id, 'pending', status)
+            elif status in ('executing', 'executed', 'failed'):
+                store.transition(token, session_id, 'pending', 'confirmed')
+                store.transition(token, session_id, 'confirmed', 'executing')
+                if status in ('executed', 'failed'):
+                    store.transition(token, session_id, 'executing', status)
         
         return jsonify({
             'success': True,
             'token': token,
             'session_id': session_id,
             'status': status,
-            'message': f'Token {token} seeded directly into pending_actions.json (single source of truth)'
+            'message': f'Token {token} seeded directly into shared store'
         })
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 
 if __name__ == '__main__':

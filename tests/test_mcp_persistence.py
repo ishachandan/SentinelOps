@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Test that MCP PENDING_ACTIONS persist across connections"""
+"""Test that MCP actions persist across independent connections."""
 import asyncio
 import json
 import os
+from pathlib import Path
 import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -12,7 +14,9 @@ async def connection_1_seed():
     print("[CONN 1] Creating MCP connection and seeding token...")
     env = dict(os.environ)
     env["ENABLE_DEBUG_ENDPOINTS"] = "true"
-    server_params = StdioServerParameters(command=sys.executable, args=['server.py'], env=env)
+    env["USE_REAL_APIS"] = "false"
+    server_path = str(Path(__file__).resolve().parents[1] / "server.py")
+    server_params = StdioServerParameters(command=sys.executable, args=[server_path], env=env, cwd=str(Path(__file__).resolve().parents[1]))
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -30,20 +34,22 @@ async def connection_1_seed():
             assert "DEBUG: Seeded pending action" in result.content[0].text
     print("[CONN 1] Connection closed\n")
 
+import store
+
 def confirm_seeded_action():
     """Simulate Flask's confirmation update between MCP subprocesses."""
-    pending_file = os.path.join("data", "pending_actions.json")
-    with open(pending_file, "r", encoding="utf-8") as f:
-        actions = json.load(f)
-    actions["persist_test_XYZ"]["status"] = "confirmed"
-    with open(pending_file, "w", encoding="utf-8") as f:
-        json.dump(actions, f, indent=2)
-    print("[FILE] Marked persist_test_XYZ as confirmed")
+    action = store.get_action("persist_test_XYZ")
+    session_id = action.get("session_id", "default") if action else "default"
+    assert store.transition("persist_test_XYZ", session_id, frm="pending", to="confirmed")
+    print("[STORE] Marked persist_test_XYZ as confirmed")
 
 async def connection_2_execute():
     """Connection 2: Try to execute the token from connection 1"""
     print("[CONN 2] Creating NEW MCP connection and trying to execute token...")
-    server_params = StdioServerParameters(command=sys.executable, args=['server.py'])
+    env = dict(os.environ)
+    env["USE_REAL_APIS"] = "false"
+    server_path = str(Path(__file__).resolve().parents[1] / "server.py")
+    server_params = StdioServerParameters(command=sys.executable, args=[server_path], env=env, cwd=str(Path(__file__).resolve().parents[1]))
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -59,7 +65,7 @@ async def connection_2_execute():
 
 async def main():
     print("="*70)
-    print("Testing MCP PENDING_ACTIONS persistence across connections")
+    print("Testing MCP actions persistence across connections")
     print("="*70 + "\n")
     
     # Connection 1: seed
@@ -71,9 +77,9 @@ async def main():
     # Connection 2: execute
     await connection_2_execute()
 
-    with open(os.path.join("data", "pending_actions.json"), "r", encoding="utf-8") as f:
-        actions = json.load(f)
-    assert actions["persist_test_XYZ"]["status"] == "executed"
+    action = store.get_action("persist_test_XYZ")
+    assert action is not None
+    assert action["status"] == "executed"
     print("[SUCCESS] Confirmed action persisted across MCP subprocesses and executed.")
 
 asyncio.run(main())

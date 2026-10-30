@@ -148,7 +148,7 @@ def confirm_action(token):
     execute_pending_action(token)
 ```
 
-The MCP server independently reloads `pending_actions.json` and refuses unknown, pending, declined, executed, and otherwise unconfirmed actions. Execution errors leave the status at `confirmed`.
+The MCP server reads the shared SQLite action and atomically claims it by changing `confirmed` to `executing`. Execution errors move it to `failed`; stale executing actions are marked failed during recovery.
 
 **Flask route responses:**
 - **404:** Prevents brute-force token guessing
@@ -192,7 +192,7 @@ PENDING_ACTIONS_FILE = "data/pending_actions.json"
 # Uses identical load/save functions
 ```
 
-**Result:** Both processes use the same persisted state instead of separate in-memory copies. The JSON file has no locking, so concurrent writes can still race.
+**Current implementation:** Flask and MCP share a SQLite database. Status changes use compare-and-set updates, so competing confirmations and execution claims cannot both win.
 
 ---
 
@@ -332,7 +332,7 @@ Quarantine proposal and execution use `realpath` and `commonpath` containment ch
 
 ## Known limitations (by design for this demo)
 
-- JSON-file storage has no locking; concurrent writes can race.
+- Action state is stored in SQLite and transitions use atomic compare-and-set updates.
 - Flask starts a new MCP subprocess per request, so evidence tokens and other MCP in-memory state do not survive across requests.
 - Conversation history is stored in the Flask cookie session.
 - `/confirm` and `/decline` do not have CSRF protection.
@@ -629,7 +629,7 @@ sentinelops/
 
 ## State Management
 
-`pending_actions.json` and `action_log.jsonl` are file-based and are not protected by file locking. `REPUTATION_RESULTS` (evidence tokens) lives only in MCP process memory.
+Action state and reputation evidence are stored in the shared SQLite database. The audit log remains JSONL, and conversation history remains in the Flask cookie session.
 
 ### Session State (in-memory)
 ```python
@@ -640,32 +640,25 @@ flask_session['conversations'][session_id] = [
 ]
 ```
 
-### Persistent State (file-based)
+### Persistent State (SQLite)
 ```python
-# pending_actions.json
-{
-    "token": {
-        "action_type": "...",
-        "status": "...",
-        "session_id": "...",
-        "created_at": "...",
-        "executed_at": "..."
-    }
-}
+pending -> confirmed -> executing -> executed | failed
+pending -> declined | expired
 ```
+
+Each transition checks the current status in the same `UPDATE`. Pending actions expire after 15 minutes; an executing action older than five minutes is recovered as failed with an unknown outcome.
 
 ## Scaling Considerations
 
 ### Single Instance (Current)
 - Session storage: In-memory (Flask session)
-- File storage: Shared volume
+- Storage: Shared SQLite database on a local named volume
 - Limitation: Only one container
 
-### Multi-Instance (Future)
+### Multi-Host Deployment
 - Session storage: Redis / Memcached
-- File storage: Shared network volume (NFS)
+- Database: Networked database such as PostgreSQL; SQLite WAL is single-host and unsuitable for shared network filesystems
 - Load balancer: nginx / Traefik / HAProxy
-- Limitation: File locking for pending_actions.json
 
 ## Technology Stack
 

@@ -4,41 +4,40 @@ import os
 import json
 import re
 import sys
+import uuid
 from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from agent_shared import HUMAN_ONLY_TOOLS, convert_mcp_tools_to_groq_format
+import store
 
 load_dotenv()
 
 
 def update_pending_action_status(token: str, status: str):
-    """Update an action's human resolution in the shared file."""
-    pending_file = os.path.join("data", "pending_actions.json")
-    try:
-        with open(pending_file, "r", encoding="utf-8") as f:
-            actions = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    """Update an action's human resolution in the shared SQLite store."""
+    action = store.get_action(token)
+    if not action:
         return False
-
-    if token not in actions:
-        return False
-
-    actions[token]["status"] = status
-    actions[token][f"{status}_at"] = __import__("datetime").datetime.now().isoformat()
-    with open(pending_file, "w", encoding="utf-8") as f:
-        json.dump(actions, f, indent=2)
-    return True
+    session_id = action.get("session_id", "default")
+    current_status = action.get("status")
+    return store.transition(token, session_id, frm=current_status, to=status)
 
 
 def mark_pending_action_confirmed(token: str):
-    """Mark a pending action as confirmed in the shared file."""
-    return update_pending_action_status(token, "confirmed")
+    """Mark a pending action as confirmed in the shared SQLite store."""
+    action = store.get_action(token)
+    if not action:
+        return False
+    session_id = action.get("session_id", "default")
+    return store.transition(token, session_id, frm="pending", to="confirmed")
 
 
-async def run_cli():
+
+async def run_cli(session_id: str = None):
     """Run interactive CLI with multi-turn conversation history."""
+    effective_session_id = session_id or os.getenv("SENTINELOPS_SESSION_ID") or f"cli_{uuid.uuid4().hex[:12]}"
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     if not client.api_key:
         print("Error: GROQ_API_KEY not configured in .env file")
@@ -46,12 +45,15 @@ async def run_cli():
     
     print("="*70)
     print("SentinelOps - Security Copilot CLI")
+    print(f"Session ID: {effective_session_id}")
     print("="*70)
     print("Type 'exit' or 'quit' to end the session")
     print("Type 'clear' to reset conversation history")
     print("="*70)
     
-    server_params = StdioServerParameters(command="python", args=["server.py"])
+    server_env = dict(os.environ)
+    server_env["SENTINELOPS_SESSION_ID"] = effective_session_id
+    server_params = StdioServerParameters(command=sys.executable, args=["server.py"], env=server_env)
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -91,7 +93,7 @@ async def run_cli():
                     # Process with agent - up to 10 turns for tool chaining
                     for turn in range(10):
                         response = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
+                            model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
                             messages=messages,
                             tools=groq_tools,
                             max_tokens=1024
@@ -170,6 +172,7 @@ async def run_cli():
                                             })
                                     else:
                                         print("DECLINED: Action NOT executed.\n")
+                                        update_pending_action_status(token, "declined")
                                         declined_msg = "Human user declined to execute this action."
                                         tool_results.append({
                                             "role": "tool",
@@ -240,6 +243,10 @@ async def run_cli():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="SentinelOps CLI")
+    parser.add_argument("--session", dest="session_id", default=None, help="Custom session ID (defaults to a fresh session per run)")
+    args = parser.parse_args()
     print("\nStarting SentinelOps CLI...")
     print("(Server startup may take ~30s for ChromaDB initialization)\n")
-    asyncio.run(run_cli())
+    asyncio.run(run_cli(session_id=args.session_id))

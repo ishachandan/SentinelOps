@@ -20,7 +20,6 @@ from server import (
     propose_quarantine_file,
     execute_pending_action,
     get_action_log,
-    PENDING_ACTIONS,
     REPUTATION_RESULTS
 )
 
@@ -28,16 +27,20 @@ from server import (
 @pytest.fixture(autouse=True)
 def clear_state(tmp_path, monkeypatch):
     """Clear global state before each test"""
+    import store
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    monkeypatch.setattr(server, "PENDING_ACTIONS_FILE", str(data_dir / "pending_actions.json"))
+    db_file = data_dir / "sentinelops.db"
+    monkeypatch.setattr(store, "DB_PATH", str(db_file))
+    monkeypatch.setenv("SENTINELOPS_DB_PATH", str(db_file))
+    store.init_db(str(db_file))
+    store.clear_store(str(db_file))
     monkeypatch.setattr(server, "ACTION_LOG_FILE", str(data_dir / "action_log.jsonl"))
     monkeypatch.setattr(server, "INCIDENTS_FILE", str(data_dir / "incidents.json"))
     monkeypatch.setattr(server, "FIREWALL_SANDBOX_DIR", str(data_dir / "firewall_sandbox"))
-    PENDING_ACTIONS.clear()
     REPUTATION_RESULTS.clear()
     yield
-    PENDING_ACTIONS.clear()
+    store.clear_store(str(db_file))
     REPUTATION_RESULTS.clear()
 
 
@@ -159,8 +162,9 @@ def test_pending_action_token_lifecycle():
     result = execute_pending_action(token=token)
     assert "pending and not confirmed" in result.lower()
 
-    PENDING_ACTIONS[token]["status"] = "confirmed"
-    server.save_pending_actions(PENDING_ACTIONS)
+    import store
+    action = store.get_action(token)
+    assert store.transition(token, action["session_id"], frm="pending", to="confirmed")
     result = execute_pending_action(token=token)
     assert "Blocked IP" in result or "SANDBOX" in result
 

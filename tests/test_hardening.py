@@ -12,6 +12,8 @@ import agent_shared
 import cli
 import server
 import web_ui
+import store
+
 
 
 @pytest.fixture
@@ -20,21 +22,25 @@ def isolated_server(tmp_path, monkeypatch):
     quarantine = sandbox / "quarantine"
     sandbox.mkdir(parents=True)
     quarantine.mkdir()
-    pending_file = tmp_path / "data" / "pending_actions.json"
+    import store
+    db_file = tmp_path / "data" / "sentinelops.db"
     audit_file = tmp_path / "data" / "action_log.jsonl"
     incidents_file = tmp_path / "incidents.json"
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(server, "QUARANTINE_SANDBOX_DIR", str(sandbox))
     monkeypatch.setattr(server, "QUARANTINE_DIR", str(quarantine))
-    monkeypatch.setattr(server, "PENDING_ACTIONS_FILE", str(pending_file))
+    monkeypatch.setattr(store, "DB_PATH", str(db_file))
+    monkeypatch.setenv("SENTINELOPS_DB_PATH", str(db_file))
+    store.init_db(str(db_file))
+    store.clear_store(str(db_file))
     monkeypatch.setattr(server, "ACTION_LOG_FILE", str(audit_file))
     monkeypatch.setattr(server, "INCIDENTS_FILE", str(incidents_file))
     monkeypatch.setattr(server, "ACTION_LOG", [])
     monkeypatch.setattr(server, "USE_REAL_APIS", False)
-    server.PENDING_ACTIONS.clear()
+    store.clear_store(str(db_file))
     server.REPUTATION_RESULTS.clear()
-    return sandbox, pending_file, audit_file, incidents_file
+    return sandbox, db_file, audit_file, incidents_file
 
 
 def read_audit(path):
@@ -100,9 +106,7 @@ def test_quarantine_symlink_escape_rejected_at_proposal_and_execution(
     candidate.write_text("sample", encoding="utf-8")
     result = server.propose_quarantine_file(str(candidate), "test")
     token = result.split("Token: ", 1)[1].splitlines()[0]
-    actions = server.load_pending_actions()
-    actions[token]["status"] = "confirmed"
-    server.save_pending_actions(actions)
+    assert store.transition(token, "default", frm="pending", to="confirmed")
     candidate.unlink()
     try:
         os.symlink(outside, candidate)
@@ -112,8 +116,7 @@ def test_quarantine_symlink_escape_rejected_at_proposal_and_execution(
     result = server.execute_pending_action(token)
 
     assert result == "Error: File is outside the quarantine sandbox."
-    with pending_file.open(encoding="utf-8") as actions_file:
-        assert json.load(actions_file)[token]["status"] == "confirmed"
+    assert store.get_action(token)["status"] == "failed"
 
 
 def test_audit_log_persists_calls_and_skips_malformed_lines(isolated_server):
@@ -137,8 +140,13 @@ def test_audit_log_persists_calls_and_skips_malformed_lines(isolated_server):
 )
 def test_execute_pending_action_refusals_are_logged(isolated_server, status, expected):
     _, _, audit_file, _ = isolated_server
-    actions = {"test-token": {"action_type": "block_ip", "ip": "8.8.8.8", "status": status}}
-    server.save_pending_actions(actions)
+    store.create_action("test-token", "default", "block_ip", {"ip": "8.8.8.8"})
+    if status == "declined":
+        store.transition("test-token", "default", "pending", "declined")
+    elif status == "executed":
+        store.transition("test-token", "default", "pending", "confirmed")
+        store.transition("test-token", "default", "confirmed", "executing")
+        store.transition("test-token", "default", "executing", "executed")
 
     result = server.execute_pending_action("test-token")
 
@@ -169,16 +177,14 @@ def test_unknown_execution_token_is_logged_without_token_value(isolated_server):
     assert read_audit(audit_file)[0]["reason"] == "unknown_token"
 
 
-def test_failed_execution_keeps_confirmed_state(isolated_server, monkeypatch):
-    _, pending_file, audit_file, _ = isolated_server
-    server.save_pending_actions({
-        "failed-token": {"action_type": "block_ip", "ip": "8.8.8.8", "status": "confirmed"}
-    })
+def test_failed_execution_transitions_to_failed_state(isolated_server, monkeypatch):
+    _, _, audit_file, _ = isolated_server
+    store.create_action("failed-token", "default", "block_ip", {"ip": "203.0.113.199"})
+    store.transition("failed-token", "default", "pending", "confirmed")
     monkeypatch.setattr(server, "execute_block_ip_stub", lambda _action, _token: "Error: simulated")
 
     assert "Error:" in server.execute_pending_action("failed-token")
-    with pending_file.open(encoding="utf-8") as actions_file:
-        assert json.load(actions_file)["failed-token"]["status"] == "confirmed"
+    assert store.get_action("failed-token")["status"] == "failed"
     assert read_audit(audit_file)[0]["reason"] == "execution_failed"
 
 
@@ -351,6 +357,7 @@ def test_tool_conversion_filters_human_only_tools():
     response = SimpleNamespace(tools=[
         make_mcp_tool("execute_pending_action"),
         make_mcp_tool("debug_seed_pending_action"),
+        make_mcp_tool("expire_blocks"),
         make_mcp_tool("ping"),
     ])
 
@@ -417,8 +424,12 @@ def test_cli_human_confirmation_controls_proposal_execution(
     monkeypatch.setenv("GROQ_API_KEY", "fake-groq-key")
     inputs = iter(["block 45.33.22.11", confirmation, "exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
-    pending_file = tmp_path / "data" / "pending_actions.json"
-    pending_file.parent.mkdir()
+    import store
+    db_file = tmp_path / "data" / "sentinelops.db"
+    monkeypatch.setattr(store, "DB_PATH", str(db_file))
+    monkeypatch.setenv("SENTINELOPS_DB_PATH", str(db_file))
+    store.init_db(str(db_file))
+    store.clear_store(str(db_file))
     calls = []
     status_observed_at_execution = []
 
@@ -436,17 +447,15 @@ def test_cli_human_confirmation_controls_proposal_execution(
         async def call_tool(self, name, args):
             calls.append(name)
             if name == "propose_block_ip":
-                pending_file.write_text(json.dumps({
-                    "c11a1234": {"status": "pending", "action_type": "block_ip"}
-                }), encoding="utf-8")
+                store.create_action("c11a1234", "default", "block_ip", {"ip": "45.33.22.11"})
                 return SimpleNamespace(content=[SimpleNamespace(
                     text="PREVIEW: Would block IP 45.33.22.11\nToken: c11a1234"
                 )])
             assert name == "execute_pending_action"
-            actions = json.loads(pending_file.read_text(encoding="utf-8"))
-            status_observed_at_execution.append(actions["c11a1234"]["status"])
-            actions["c11a1234"]["status"] = "executed"
-            pending_file.write_text(json.dumps(actions), encoding="utf-8")
+            action = store.get_action("c11a1234")
+            status_observed_at_execution.append(action["status"])
+            store.transition("c11a1234", "default", frm="confirmed", to="executing")
+            store.transition("c11a1234", "default", frm="executing", to="executed")
             return SimpleNamespace(content=[SimpleNamespace(text="SUCCESS: blocked")])
 
     session = FakeSession()
@@ -504,7 +513,7 @@ def test_cli_human_confirmation_controls_proposal_execution(
 
     asyncio.run(cli.run_cli())
 
-    saved_action = json.loads(pending_file.read_text(encoding="utf-8"))["c11a1234"]
+    saved_action = store.get_action("c11a1234")
     assert saved_action["status"] == expected_status
     assert calls.count("execute_pending_action") == expected_executions
     if confirmation == "y":

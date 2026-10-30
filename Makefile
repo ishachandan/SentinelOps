@@ -1,11 +1,12 @@
-.PHONY: help validate build up down restart logs ps test clean
+.PHONY: help validate build up down restart logs ps test test-docker clean
 
 # Default target
 help:
-	@echo "SentinelOps Docker Management"
-	@echo "=============================="
+	@echo "SentinelOps Management"
+	@echo "======================="
 	@echo ""
 	@echo "Available commands:"
+	@echo "  make test        - Run comprehensive test suite"
 	@echo "  make validate    - Validate Docker setup"
 	@echo "  make build       - Build Docker image"
 	@echo "  make up          - Start services"
@@ -13,7 +14,7 @@ help:
 	@echo "  make restart     - Restart services"
 	@echo "  make logs        - View logs (follow mode)"
 	@echo "  make ps          - Show service status"
-	@echo "  make test        - Test deployment"
+	@echo "  make test-docker - Test Docker deployment"
 	@echo "  make clean       - Clean up containers and images"
 	@echo ""
 
@@ -48,8 +49,14 @@ logs:
 ps:
 	@docker-compose ps
 
-# Test deployment
+# Run complete test suite
 test:
+	@pytest -v
+	@python tests/e2e_stdio_check.py
+	@python tests/test_transcript_fix.py
+
+# Test deployment
+test-docker:
 	@echo "Waiting 10 seconds for services to stabilize..."
 	@sleep 10
 	@python test_docker_deployment.py

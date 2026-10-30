@@ -55,9 +55,9 @@ def main():
     decline = session.post(f"{BASE_URL}/decline/{TOKEN}", timeout=5)
     assert decline.status_code == 200, decline.text
     assert decline.json()["success"] is True
-    with open("data/pending_actions.json", encoding="utf-8") as actions_file:
-        actions = json.load(actions_file)
-    assert actions[TOKEN]["status"] == "declined"
+    import store
+    action = store.get_action(TOKEN)
+    assert action is not None and action["status"] == "declined"
     print("PASS: Flask decline persisted declined status")
 
     asyncio.run(verify_mcp_refuses_declined_action())

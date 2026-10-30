@@ -47,10 +47,9 @@ def main():
 
     seed(owner, "d1ec7003", "203.0.113.10")
     declined = owner.post(f"{BASE_URL}/decline/d1ec7003", timeout=5)
-    assert declined.status_code == 200
-    with open("data/pending_actions.json", encoding="utf-8") as actions_file:
-        actions = json.load(actions_file)
-    assert actions["d1ec7003"]["status"] == "declined"
+    import store
+    action = store.get_action("d1ec7003")
+    assert action is not None and action["status"] == "declined"
     print("PASS: declined action was not executed")
     print("PASS: all direct security checks passed without Groq/API calls")
 

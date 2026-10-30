@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional semantic log search (use Python 3.12 on Windows).
+chromadb==0.6.2
+sentence-transformers==3.4.1

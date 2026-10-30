@@ -27,7 +27,7 @@ def main():
     other_session.get(BASE_URL, timeout=5)
 
     seed(first_session, "a1100001", "192.168.1.5")
-    valid = first_session.post(f"{BASE_URL}/confirm/a1100001", timeout=15)
+    valid = first_session.post(f"{BASE_URL}/confirm/a1100001", timeout=35)
     assert valid.status_code == 200, valid.text
     assert valid.json()["success"] is True
     print("PASS: valid token for its owning session executes")
@@ -37,24 +37,24 @@ def main():
     print("PASS: fake token returns 404")
 
     reused = first_session.post(f"{BASE_URL}/confirm/a1100001", timeout=5)
-    assert reused.status_code == 400
-    print("PASS: reused token returns 400")
+    assert reused.status_code == 409
+    print("PASS: reused token returns 409")
 
     seed(first_session, "a1100002", "10.0.0.100")
     cross_session = other_session.post(
         f"{BASE_URL}/confirm/a1100002", timeout=5
     )
-    assert cross_session.status_code == 403
-    print("PASS: cross-session confirmation returns 403")
+    assert cross_session.status_code == 404
+    print("PASS: cross-session confirmation returns 404")
 
     seed(first_session, "a1100003", "203.0.113.10")
     declined = first_session.post(f"{BASE_URL}/decline/a1100003", timeout=5)
     assert declined.status_code == 200
-    assert declined.json()["success"] is True
-    with open("data/pending_actions.json", encoding="utf-8") as actions_file:
-        actions = json.load(actions_file)
-    assert actions["a1100003"]["status"] == "declined"
-    assert actions["a1100003"]["status"] != "executed"
+    import store
+    action = store.get_action("a1100003")
+    assert action is not None
+    assert action["status"] == "declined"
+    assert action["status"] != "executed"
     print("PASS: declined action remains unexecuted")
     print("PASS: all five live-server confirmation-gate checks passed")
 

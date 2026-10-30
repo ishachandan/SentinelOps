@@ -18,9 +18,11 @@ async def main():
     project_root = Path(__file__).resolve().parents[1]
     with TemporaryDirectory(prefix="sentinelops-e2e-") as temp_dir:
         work_dir = Path(temp_dir)
+        db_path = work_dir / "data" / "sentinelops.db"
         env = dict(os.environ)
         env["USE_REAL_APIS"] = "false"
         env["ENABLE_DEBUG_ENDPOINTS"] = "false"
+        env["SENTINELOPS_DB_PATH"] = str(db_path)
         params = StdioServerParameters(
             command=sys.executable,
             args=[str(project_root / "server.py")],
@@ -40,8 +42,10 @@ async def main():
                     tool["function"]["name"] for tool in exposed_tools
                 }
                 assert HUMAN_ONLY_TOOLS.isdisjoint(exposed_names)
+                assert "expire_blocks" not in exposed_names
+                assert "execute_pending_action" not in exposed_names
                 assert "check_ip_reputation" in exposed_names
-                print("PASS: model tool schemas exclude both human-only tools")
+                print("PASS: model tool schemas exclude all human-only tools (including expire_blocks)")
 
                 reputation = json.loads(
                     (await session.call_tool(
@@ -102,11 +106,15 @@ async def main():
                 assert "pending and not confirmed" in pending_result.lower()
                 print("PASS: execution before confirmation was refused")
 
-                pending_file = work_dir / "data" / "pending_actions.json"
-                actions = json.loads(pending_file.read_text(encoding="utf-8"))
-                actions[action_token]["status"] = "confirmed"
-                pending_file.write_text(json.dumps(actions, indent=2), encoding="utf-8")
-                print("PASS: action marked confirmed in the shared state file")
+                import store
+                store.DB_PATH = db_path
+                action_record = store.get_action(action_token)
+                assert action_record is not None
+                transition_ok = store.transition(
+                    action_token, action_record["session_id"], "pending", "confirmed"
+                )
+                assert transition_ok
+                print("PASS: action marked confirmed in the shared SQLite store")
 
                 executed = (await session.call_tool(
                     "execute_pending_action", {"token": action_token}

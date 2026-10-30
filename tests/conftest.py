@@ -1,5 +1,5 @@
 """Pytest configuration"""
-# Simple configuration - no session-scoped MCP fixtures due to Windows subprocess issues
+import pytest
 
 # These files are manual/live-service scripts, not offline pytest modules.
 collect_ignore = [
@@ -19,3 +19,10 @@ collect_ignore = [
     "test_transcript_fix.py",
     "test_web_ui.py",
 ]
+
+
+@pytest.fixture(autouse=True)
+def configure_unit_test_policy(request, monkeypatch):
+    """Allow legacy unit tests to test address-target format validation directly."""
+    if "test_unit" in request.node.nodeid:
+        monkeypatch.setenv("SENTINELOPS_REQUIRE_OBSERVED_IP", "false")

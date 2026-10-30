@@ -1,0 +1,13 @@
+# SentinelOps Protected Allowlist Configuration
+# Targets listed here can NEVER be blocked. Proposing a block on them will be rejected immediately.
+
+protected_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "8.8.8.8"      # Primary DNS
+  - "1.1.1.1"      # Cloudflare DNS
+  - "192.168.1.1"  # Default Gateway
+
+protected_cidrs:
+  - "127.0.0.0/8"     # Loopback network
+

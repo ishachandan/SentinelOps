@@ -11,6 +11,7 @@ __pycache__/
 .Python
 venv/
 .venv/
+.venv*/
 env/
 ENV/
 *.pyc
@@ -22,7 +23,10 @@ data/sentinelops_sandbox/
 data/chromadb_sentinelops/
 data/test_real_chromadb/
 data/pending_actions.json
-data/action_log.jsonl
+data/*.db*
+data/*.db-wal
+data/*.db-shm
+data/*.jsonl*
 
 # IDE
 .vscode/

@@ -1,13 +1,21 @@
 from mcp.server.fastmcp import FastMCP
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import datetime
 import ipaddress
 import os
+import re
 import uuid
+import time
+import store
 from dotenv import load_dotenv
 import requests
 
 load_dotenv()
+def get_session_id():
+    return os.environ.get("SENTINELOPS_SESSION_ID", "default")
+
+SESSION_ID = get_session_id()
 
 # Feature flag for real API integrations
 USE_REAL_APIS = os.getenv("USE_REAL_APIS", "false").lower() in ("true", "1", "yes")
@@ -44,14 +52,14 @@ if USE_REAL_APIS:
         sys.stderr.write("[STARTUP] USE_REAL_APIS=true, initializing ChromaDB...\n")
         sys.stderr.flush()
         
-        from sentence_transformers import SentenceTransformer
         import chromadb
         from chromadb.config import Settings
+        from chromadb.utils import embedding_functions
         
-        sys.stderr.write("[STARTUP] Loading embedding model (this may take ~30s on first run)...\n")
+        sys.stderr.write("[STARTUP] Loading ChromaDB ONNX embedding model...\n")
         sys.stderr.flush()
-        _embedding_generator = SentenceTransformer("all-MiniLM-L6-v2")
-        sys.stderr.write("[STARTUP] Embedding model loaded\n")
+        _embedding_generator = embedding_functions.DefaultEmbeddingFunction()
+        sys.stderr.write("[STARTUP] ChromaDB DefaultEmbeddingFunction loaded\n")
         sys.stderr.flush()
         
         sys.stderr.write("[STARTUP] Initializing ChromaDB client...\n")
@@ -75,17 +83,19 @@ if USE_REAL_APIS:
         
     except ImportError as e:
         import sys
-        sys.stderr.write(f"[STARTUP] WARNING: ChromaDB/sentence-transformers not available: {e}\n")
+        sys.stderr.write(f"[STARTUP] WARNING: ChromaDB not available: {e}\n")
         sys.stderr.write("[STARTUP]    search_logs will fall back to stub mode\n")
         sys.stderr.flush()
-        USE_REAL_APIS = False  # Force fallback
+        _chroma_store = None
+        _embedding_generator = None
     except Exception as e:
         import sys
         sys.stderr.write(f"[STARTUP] WARNING: Error initializing ChromaDB: {e}\n")
         sys.stderr.flush()
         import traceback
         traceback.print_exc()
-        USE_REAL_APIS = False  # Force fallback
+        _chroma_store = None
+        _embedding_generator = None
 
 def init_chromadb_store():
     """Check if ChromaDB store is initialized (no longer does lazy init)"""
@@ -117,14 +127,18 @@ def search_logs_real(query: str) -> str:
             # Windows doesn't support SIGALRM, skip timeout mechanism
             pass
         
-        # Generate query embedding (should take ~0.3s)
-        query_embedding = _embedding_generator.encode(query, convert_to_numpy=True).tolist()
-        
-        # Search ChromaDB (should take <0.01s)
-        results = _chroma_store.query(
-            query_embeddings=[query_embedding],
-            n_results=5
-        )
+        # Search ChromaDB
+        if hasattr(_embedding_generator, "encode"):
+            query_embedding = _embedding_generator.encode(query, convert_to_numpy=True).tolist()
+            results = _chroma_store.query(
+                query_embeddings=[query_embedding],
+                n_results=5
+            )
+        else:
+            results = _chroma_store.query(
+                query_texts=[query],
+                n_results=5
+            )
         
         # Cancel timeout
         try:
@@ -158,115 +172,148 @@ def search_logs_real(query: str) -> str:
         traceback.print_exc(file=sys.stderr)
         return json.dumps({"error": f"Search failed: {str(e)}"})
 
+POISONED_LOGS_FILE = os.path.join("data", "poisoned_logs_fixture.json")
+
+
+def load_poisoned_logs():
+    """Load poisoned logs fixture if available."""
+    if os.path.exists(POISONED_LOGS_FILE):
+        try:
+            with open(POISONED_LOGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def wrap_untrusted_data(content: str, source: str = "logs", max_field_len: int = 1000) -> str:
+    """Wrap untrusted external data in safe delimiters, neutralizing control sequences and truncating."""
+    if content is None:
+        return f'<untrusted_data source="{source}"></untrusted_data>'
+
+    text = str(content)
+    # Strip ANSI escape sequences: \x1b\[[0-9;]*[a-zA-Z]
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    # Neutralize control characters
+    text = text.replace('\x00', '').replace('\r', '')
+
+    # Neutralize any attempts to close the untrusted_data tag prematurely
+    text = text.replace('</untrusted_data>', '&lt;/untrusted_data&gt;')
+
+    # Truncate overly long fields or lines
+    lines = text.split('\n')
+    sanitized_lines = []
+    for line in lines:
+        if len(line) > max_field_len:
+            line = line[:max_field_len] + "... [field truncated]"
+        sanitized_lines.append(line)
+    text = '\n'.join(sanitized_lines)
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n... [content truncated]"
+
+    return f'<untrusted_data source="{source}">\n{text}\n</untrusted_data>'
+
+
 def search_logs_stub(query: str) -> str:
     """Search logs using stubbed data (substring match)."""
-    results = [l for l in FAKE_LOGS if query in json.dumps(l)]
+    dataset = list(FAKE_LOGS)
+    if os.getenv("USE_POISONED_LOGS", "false").lower() in ("true", "1", "yes") or "poison" in query.lower():
+        dataset.extend(load_poisoned_logs())
+    results = [l for l in dataset if query in json.dumps(l)]
     return json.dumps(results) if results else "No matches found."
+
 
 @mcp.tool()
 def search_logs(query: str) -> str:
     """Search recent security logs for a keyword (ip or event type)."""
-    
     if USE_REAL_APIS:
-        return search_logs_real(query)
+        raw_result = search_logs_real(query)
     else:
-        return search_logs_stub(query)
+        raw_result = search_logs_stub(query)
+
+    # Record observed IPs ONLY from structured source/client IP fields of log records.
+    # NEVER record IPs from query text, or free-text log fields (message, user_agent, raw_log, url, username, text).
+    session_id = get_session_id()
+    try:
+        import policy
+        parsed = json.loads(raw_result)
+        if isinstance(parsed, list):
+            structured_ip_keys = ("ip", "source_ip", "client_ip", "src_ip")
+            for entry in parsed:
+                if isinstance(entry, dict):
+                    event_val = (
+                        entry.get("event") or entry.get("event_type") or
+                        entry.get("type") or entry.get("action")
+                    )
+                    meta = entry.get("metadata")
+                    if not event_val and isinstance(meta, dict):
+                        event_val = (
+                            meta.get("event") or meta.get("event_type") or
+                            meta.get("type") or meta.get("action")
+                        )
+
+                    if policy.is_suspicious_event(event_val):
+                        slug = str(event_val).strip().lower().replace(" ", "_").replace("-", "_")
+                        source_label = f"search_logs_match:{slug}"
+                    else:
+                        source_label = "search_logs_benign"
+
+                    # Check structured fields directly on the log record
+                    for key in structured_ip_keys:
+                        val = entry.get(key)
+                        if val and isinstance(val, str):
+                            try:
+                                norm_ip = normalize_ip(val)
+                                store.record_observed_ip(session_id, norm_ip, source=source_label)
+                            except Exception:
+                                pass
+                            break
+                    # If ChromaDB or external source wrapped record with a structured metadata dict
+                    if isinstance(meta, dict):
+                        for key in structured_ip_keys:
+                            val = meta.get(key)
+                            if val and isinstance(val, str):
+                                try:
+                                    norm_ip = normalize_ip(val)
+                                    store.record_observed_ip(session_id, norm_ip, source=source_label)
+                                except Exception:
+                                    pass
+                                break
+    except Exception:
+        pass
+
+    return wrap_untrusted_data(raw_result, source="logs")
 
 # Phase 3: First action tool (dry-run only)
+import audit_chain
 ACTION_LOG_FILE = os.path.join("data", "action_log.jsonl")
 ACTION_LOG = []
 
-# File-based storage for PENDING_ACTIONS to persist between MCP connections
-PENDING_ACTIONS_FILE = "data/pending_actions.json"
-
-
-def load_pending_actions():
-    """Load pending actions from file."""
-    try:
-        with open(PENDING_ACTIONS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_pending_actions(actions):
-    """Save pending actions to file."""
-    os.makedirs(os.path.dirname(PENDING_ACTIONS_FILE), exist_ok=True)
-    with open(PENDING_ACTIONS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(actions, f, indent=2)
-
-
 def load_action_log():
     """Read the JSONL audit log, skipping malformed entries."""
-    entries = []
-    if not os.path.exists(ACTION_LOG_FILE):
-        return entries
-    with open(ACTION_LOG_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                entries.append(record)
-    return entries
+    return audit_chain.read_audit_log(ACTION_LOG_FILE)
 
 
 def log_action(entry):
-    """Append a sanitized, timestamped action to the JSONL audit log."""
-    sensitive_keys = {"api_key", "bot_token", "chat_id", "secret", "password", "evidence_token", "token"}
-    secrets = [
-        os.getenv(name)
-        for name in ("ABUSEIPDB_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY", "FLASK_SECRET_KEY")
-        if os.getenv(name)
-    ]
-
-    def sanitize(value):
-        if isinstance(value, str):
-            for secret in secrets:
-                value = value.replace(secret, "[REDACTED]")
-            return value
-        if isinstance(value, list):
-            return [sanitize(item) for item in value]
-        if isinstance(value, dict):
-            return {
-                key: sanitize(item) for key, item in value.items()
-                if key.lower() not in sensitive_keys
-                and not any(secret in key.lower() for secret in ("api_key", "bot_token", "secret", "password"))
-            }
-        return value
-
-    safe_entry = sanitize(entry)
-    safe_entry["timestamp"] = str(datetime.datetime.now())
-    log_path = os.path.abspath(ACTION_LOG_FILE)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    line = json.dumps(safe_entry, ensure_ascii=True) + "\n"
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(line)
-    ACTION_LOG.append(safe_entry)
-    return safe_entry
+    """Append a sanitized, timestamped, chained action to the JSONL audit log."""
+    record = audit_chain.append_audit_entry(entry, log_path=ACTION_LOG_FILE)
+    ACTION_LOG.append(record)
+    return record
 
 
-def _log_rejection(action, reason):
-    log_action({"action": action, "status": "rejected", "reason": reason})
+def _log_rejection(action, reason, target=None):
+    entry = {"action": action, "status": "rejected", "reason": reason}
+    if target:
+        entry["target"] = target
+    log_action(entry)
 
 
-PENDING_ACTIONS = load_pending_actions()
 ACTION_LOG = load_action_log()
 
 def normalize_ip(value):
     """Parse an IPv4/IPv6 value and return its canonical string."""
-    if value is None:
-        raise ValueError("Missing IP address")
-    text = str(value).strip()
-    if not text:
-        raise ValueError("Empty IP address")
-    try:
-        return str(ipaddress.ip_address(text))
-    except ValueError as exc:
-        raise ValueError(f"Invalid IP address '{text}'") from exc
+    return store.normalize_ip(value)
 
 
 def validate_ip(value):
@@ -318,20 +365,27 @@ def propose_block_ip(ip: str, reason: str) -> str:
         _log_rejection("propose_block_ip", "invalid_block_ip")
         return f"Error: {exc}"
 
-    actions = load_pending_actions()
-    token = generate_action_token()
-    actions[token] = {
-        "action_type": "block_ip",
-        "ip": validated_ip,
-        "reason": reason,
-        "status": "pending",
-        "created_at": str(datetime.datetime.now())
-    }
-    PENDING_ACTIONS.clear()
-    PENDING_ACTIONS.update(actions)
-    save_pending_actions(actions)
+    # Step 1: Policy check - IP must have been observed in this session with justified evidence
+    import policy
+    allowed, reason_code = policy.evaluate_block_ip_policy(get_session_id(), validated_ip)
+    if not allowed:
+        _log_rejection("propose_block_ip", reason_code, target=validated_ip)
+        return f"Error: Block proposal rejected by security policy ({reason_code}). Target: {validated_ip}."
 
-    return f"PREVIEW: Would block IP {validated_ip}. Reason: {reason}\nToken: {token}\nAwaiting human confirmation."
+    store.expire_stale()
+    severity, required_approvals = policy.derive_block_severity(get_session_id(), validated_ip)
+    token = generate_action_token()
+    action_rec = store.create_action(
+        token=token,
+        session_id=get_session_id(),
+        action_type="block_ip",
+        params={"ip": validated_ip, "reason": reason},
+        severity=severity,
+        required_approvals=required_approvals
+    )
+    hash_short = action_rec.get("params_hash", "")[:8]
+
+    return f"PREVIEW: Would block IP {validated_ip}. Reason: {reason}\nToken: {token}\nParams Hash: {hash_short}\nAwaiting human confirmation."
 
 @mcp.tool()
 def propose_quarantine_file(path: str, reason: str) -> str:
@@ -346,35 +400,178 @@ def propose_quarantine_file(path: str, reason: str) -> str:
     if not os.path.exists(resolved_path):
         return "Error: File not found in quarantine sandbox."
 
-    actions = load_pending_actions()
+    store.expire_stale()
     token = generate_action_token()
-    actions[token] = {
-        "action_type": "quarantine_file",
-        "path": resolved_path,
-        "reason": reason,
-        "status": "pending",
-        "created_at": str(datetime.datetime.now())
-    }
-    PENDING_ACTIONS.clear()
-    PENDING_ACTIONS.update(actions)
-    save_pending_actions(actions)
+    action_rec = store.create_action(
+        token=token,
+        session_id=get_session_id(),
+        action_type="quarantine_file",
+        params={"path": resolved_path, "reason": reason}
+    )
+    hash_short = action_rec.get("params_hash", "")[:8]
 
-    return f"PREVIEW: Would quarantine file: {resolved_path}. Reason: {reason}\nToken: {token}\nAwaiting human confirmation."
+    return f"PREVIEW: Would quarantine file: {resolved_path}. Reason: {reason}\nToken: {token}\nParams Hash: {hash_short}\nAwaiting human confirmation."
+
+def is_ip_currently_blocked(ip: str) -> bool:
+    """Check if an IP currently has an active block rule in the system."""
+    try:
+        canonical_ip = normalize_ip(ip)
+    except ValueError:
+        return False
+    # 1. Check firewall sandbox filesystem rule
+    rule_file = os.path.join(FIREWALL_SANDBOX_DIR, safe_ip_rule_filename(canonical_ip))
+    if os.path.exists(rule_file):
+        return True
+    # 2. Check store for executed block_ip action that has not been unblocked
+    try:
+        with store.tx() as c:
+            cur = c.execute(
+                "SELECT params_json, resolved_at FROM actions WHERE action_type='block_ip' AND status='executed' ORDER BY resolved_at DESC"
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                try:
+                    p = json.loads(r["params_json"])
+                    if normalize_ip(p.get("ip", "")) == canonical_ip:
+                        block_time = r["resolved_at"] or 0
+                        cur_unblock = c.execute(
+                            "SELECT params_json, resolved_at FROM actions WHERE action_type='unblock_ip' AND status='executed' ORDER BY resolved_at DESC LIMIT 1"
+                        )
+                        u_row = cur_unblock.fetchone()
+                        if u_row:
+                            u_p = json.loads(u_row["params_json"])
+                            if normalize_ip(u_p.get("ip", "")) == canonical_ip and (u_row["resolved_at"] or 0) >= block_time:
+                                return False
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+
+def is_file_currently_quarantined(resolved_path: str) -> bool:
+    """Check if a file target currently exists in the quarantine store."""
+    norm_target = os.path.normcase(os.path.realpath(resolved_path))
+    filename = os.path.basename(resolved_path)
+    # 1. Check filesystem quarantine directory for metadata or candidate file
+    if os.path.exists(QUARANTINE_DIR):
+        for fname in os.listdir(QUARANTINE_DIR):
+            if fname.endswith(".metadata"):
+                meta_p = os.path.join(QUARANTINE_DIR, fname)
+                try:
+                    with open(meta_p, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    if os.path.normcase(os.path.realpath(meta.get("original_path", ""))) == norm_target:
+                        q_path = meta.get("quarantined_path")
+                        if q_path and os.path.exists(q_path):
+                            return True
+                except Exception:
+                    pass
+            elif fname.endswith(f"_{filename}") or fname == filename:
+                cand = os.path.join(QUARANTINE_DIR, fname)
+                if os.path.exists(cand):
+                    return True
+    # 2. Check store for executed quarantine action that has not been restored
+    try:
+        with store.tx() as c:
+            cur = c.execute(
+                "SELECT params_json, resolved_at FROM actions WHERE action_type='quarantine_file' AND status='executed' ORDER BY resolved_at DESC"
+            )
+            for r in cur.fetchall():
+                try:
+                    p = json.loads(r["params_json"])
+                    if os.path.normcase(os.path.realpath(p.get("path", ""))) == norm_target:
+                        q_time = r["resolved_at"] or 0
+                        cur_restore = c.execute(
+                            "SELECT params_json, resolved_at FROM actions WHERE action_type IN ('restore_quarantined_file', 'restore_file') AND status='executed' ORDER BY resolved_at DESC LIMIT 1"
+                        )
+                        rst_row = cur_restore.fetchone()
+                        if rst_row:
+                            rst_p = json.loads(rst_row["params_json"])
+                            if os.path.normcase(os.path.realpath(rst_p.get("path", ""))) == norm_target and (rst_row["resolved_at"] or 0) >= q_time:
+                                return False
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+
+@mcp.tool()
+def propose_unblock_ip(ip: str, reason: str) -> str:
+    """Propose unblocking a previously blocked IP address. This ONLY creates a preview - it does NOT execute the unblock.
+    Returns a unique action token that must be confirmed by a human before execution."""
+    try:
+        validated_ip = validate_ip(ip)
+    except ValueError as exc:
+        _log_rejection("propose_unblock_ip", "invalid_ip")
+        return f"Error: {exc}"
+
+    if not is_ip_currently_blocked(validated_ip):
+        _log_rejection("propose_unblock_ip", "policy_denied:not_blocked", target=validated_ip)
+        return f"Error: Cannot propose unblock for IP {validated_ip}. No active block rule found."
+
+    store.expire_stale()
+    token = generate_action_token()
+    action_rec = store.create_action(
+        token=token,
+        session_id=get_session_id(),
+        action_type="unblock_ip",
+        params={"ip": validated_ip, "reason": reason},
+        severity="medium",
+        required_approvals=1
+    )
+    hash_short = action_rec.get("params_hash", "")[:8]
+    return f"PREVIEW: Would unblock IP {validated_ip}. Reason: {reason}\nToken: {token}\nParams Hash: {hash_short}\nAwaiting human confirmation."
+
+@mcp.tool()
+def propose_restore_quarantined_file(path: str, reason: str) -> str:
+    """Propose restoring a previously quarantined file. This ONLY creates a preview - it does NOT execute the restore.
+    Returns a unique action token that must be confirmed by a human before execution."""
+    resolved_path = _resolve_in_sandbox(path)
+    if resolved_path is None:
+        _log_rejection("propose_restore_quarantined_file", "outside_quarantine_sandbox")
+        return "Error: File is outside the quarantine sandbox."
+
+    if not is_file_currently_quarantined(resolved_path):
+        _log_rejection("propose_restore_quarantined_file", "policy_denied:not_quarantined", target=resolved_path)
+        return f"Error: Cannot propose restore for {resolved_path}. No matching quarantined file found."
+
+    store.expire_stale()
+    token = generate_action_token()
+    action_rec = store.create_action(
+        token=token,
+        session_id=get_session_id(),
+        action_type="restore_quarantined_file",
+        params={"path": resolved_path, "reason": reason},
+        severity="medium",
+        required_approvals=1
+    )
+    hash_short = action_rec.get("params_hash", "")[:8]
+    return f"PREVIEW: Would restore file: {resolved_path}. Reason: {reason}\nToken: {token}\nParams Hash: {hash_short}\nAwaiting human confirmation."
+
+@mcp.tool()
+def expire_blocks() -> str:
+    """Check and revert expired IP blocks whose TTL has elapsed."""
+    expired = expire_active_blocks()
+    store.expire_stale()
+    if expired:
+        return f"SUCCESS: Expired {len(expired)} block rules: {', '.join(expired)}"
+    return "No active block rules have expired."
 
 @mcp.tool()
 def execute_pending_action(token: str) -> str:
     """Execute a previously proposed action using its token.
     This is a DESTRUCTIVE operation - only call this after explicit human approval.
     The action can only be executed once per token."""
-    actions = load_pending_actions()
-    PENDING_ACTIONS.clear()
-    PENDING_ACTIONS.update(actions)
+    action = store.get_action(token)
 
-    if token not in PENDING_ACTIONS:
+    if not action:
         _log_rejection("execute_pending_action", "unknown_token")
         return f"Error: Token '{token}' not found. It may be invalid or already executed. Tokens are only valid within the same MCP server process/session."
 
-    action = PENDING_ACTIONS[token]
     status = action.get("status")
 
     if status == "pending":
@@ -386,52 +583,153 @@ def execute_pending_action(token: str) -> str:
     if status == "executed":
         _log_rejection("execute_pending_action", "already_executed")
         return f"Error: Action with token '{token}' was already executed."
+    if status == "failed":
+        _log_rejection("execute_pending_action", "already_failed")
+        return f"Error: Action with token '{token}' failed execution."
+    if status == "expired":
+        _log_rejection("execute_pending_action", "expired")
+        return f"Error: Action with token '{token}' has expired."
     if status != "confirmed":
         _log_rejection("execute_pending_action", "invalid_status")
         return f"Error: Action with token '{token}' is in an invalid state for execution: {status}."
 
+    # Parameter binding re-verification from DB row immediately before executing
+    stored_hash = action.get("params_hash")
+    if stored_hash:
+        target = action.get("ip") or action.get("path") or action.get("target") or ""
+        reason = action.get("reason", "")
+        expires_at = action.get("expires_at", 0.0)
+        action_type = action.get("action_type", "")
+        severity = action.get("severity", "medium")
+        required_approvals = action.get("required_approvals", 1)
+        computed_hash = store.compute_action_params_hash(
+            action_type, target, reason, expires_at, severity, required_approvals
+        )
+        if computed_hash != stored_hash:
+            store.transition(token, action.get("session_id", "default"), frm="confirmed", to="failed")
+            _log_rejection("execute_pending_action", "refusal:params_hash_mismatch", target=target)
+            return "Error: Parameter binding verification failed. Target or parameters were mutated after proposal."
+
+    session_id = action.get("session_id", "default")
+
+    # In MCP, claim the work atomically (confirmed -> executing) before the side effect
+    if not store.transition(token, session_id, frm="confirmed", to="executing"):
+        _log_rejection("execute_pending_action", "claim_failed")
+        return f"Error: Failed to claim action with token '{token}' for execution (may have expired or changed status)."
+
     action_type = action.get("action_type")
     if action_type == "block_ip":
-        if USE_REAL_APIS:
-            result = execute_block_ip_real(action, token)
-        else:
-            result = execute_block_ip_stub(action, token)
+        target_ip = action.get("ip") or action.get("target") or ""
+        import policy
+        is_prot, prot_msg = policy.is_ip_protected(target_ip)
+        if is_prot:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "refusal:protected_target", target=target_ip)
+            return f"Error: Target IP {target_ip} is protected by policy allowlist and cannot be blocked."
+
+        try:
+            if USE_REAL_APIS:
+                result = execute_block_ip_real(action, token)
+            else:
+                result = execute_block_ip_stub(action, token)
+        except Exception as exc:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return f"Error executing block_ip: {exc}"
+
         if is_execution_error(result):
+            store.transition(token, session_id, frm="executing", to="failed")
             _log_rejection("execute_pending_action", "execution_failed")
             return result
-        action["status"] = "executed"
-        action["executed_at"] = str(datetime.datetime.now())
-        save_pending_actions(PENDING_ACTIONS)
+
+        store.transition(token, session_id, frm="executing", to="executed")
         return result
 
     elif action_type == "quarantine_file":
         resolved_path = _resolve_in_sandbox(action.get("path", ""))
         if resolved_path is None:
+            store.transition(token, session_id, frm="executing", to="failed")
             _log_rejection("execute_pending_action", "outside_quarantine_sandbox")
             return "Error: File is outside the quarantine sandbox."
-        if not os.path.exists(resolved_path):
+        quarantine_target = os.path.join(QUARANTINE_DIR, f"{token}_{os.path.basename(resolved_path)}")
+        already_quarantined = USE_REAL_APIS and os.path.exists(quarantine_target)
+        if not os.path.exists(resolved_path) and not already_quarantined:
+            store.transition(token, session_id, frm="executing", to="failed")
             return "Error: File not found in quarantine sandbox."
+
         action["path"] = resolved_path
-        if USE_REAL_APIS:
-            result = execute_quarantine_file_real(action, token)
-        else:
-            result = execute_quarantine_file_stub(action, token)
+        try:
+            if USE_REAL_APIS:
+                result = execute_quarantine_file_real(action, token)
+            else:
+                result = execute_quarantine_file_stub(action, token)
+        except Exception as exc:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return f"Error executing quarantine_file: {exc}"
+
         if is_execution_error(result):
+            store.transition(token, session_id, frm="executing", to="failed")
             _log_rejection("execute_pending_action", "execution_failed")
             return result
-        action["status"] = "executed"
-        action["executed_at"] = str(datetime.datetime.now())
-        save_pending_actions(PENDING_ACTIONS)
+
+        store.transition(token, session_id, frm="executing", to="executed")
+        return result
+
+    elif action_type == "unblock_ip":
+        try:
+            if USE_REAL_APIS:
+                result = execute_unblock_ip_real(action, token)
+            else:
+                result = execute_unblock_ip_stub(action, token)
+        except Exception as exc:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return f"Error executing unblock_ip: {exc}"
+
+        if is_execution_error(result):
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return result
+
+        store.transition(token, session_id, frm="executing", to="executed")
+        return result
+
+    elif action_type in ("restore_quarantined_file", "restore_file"):
+        resolved_path = _resolve_in_sandbox(action.get("path", ""))
+        if resolved_path is None:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "outside_quarantine_sandbox")
+            return "Error: Restore target is outside the quarantine sandbox."
+
+        action["path"] = resolved_path
+        try:
+            if USE_REAL_APIS:
+                result = execute_restore_quarantined_file_real(action, token)
+            else:
+                result = execute_restore_quarantined_file_stub(action, token)
+        except Exception as exc:
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return f"Error executing restore_quarantined_file: {exc}"
+
+        if is_execution_error(result):
+            store.transition(token, session_id, frm="executing", to="failed")
+            _log_rejection("execute_pending_action", "execution_failed")
+            return result
+
+        store.transition(token, session_id, frm="executing", to="executed")
         return result
 
     else:
+        store.transition(token, session_id, frm="executing", to="failed")
         return f"Error: Unknown action type '{action_type}'"
 
 # Sandbox directory for real firewall rule simulation
 FIREWALL_SANDBOX_DIR = "data/firewall_sandbox"
 
 def execute_block_ip_real(action: dict, token: str) -> str:
-    """Execute real IP block in sandboxed environment."""
+    """Execute real IP block in sandboxed environment idempotently."""
     import os
 
     try:
@@ -452,8 +750,21 @@ def execute_block_ip_real(action: dict, token: str) -> str:
             "status": "active"
         }
 
-        with open(rule_file, 'w', encoding='utf-8') as f:
-            json.dump(rule_content, f, indent=2)
+        try:
+            with open(rule_file, 'x', encoding='utf-8') as f:
+                json.dump(rule_content, f, indent=2)
+        except FileExistsError:
+            entry = {
+                "action": "block_ip",
+                "ip": ip,
+                "reason": reason,
+                "time": timestamp,
+                "sandbox_file": rule_file,
+                "status": "executed",
+                "token": token
+            }
+            log_action(entry)
+            return f"SUCCESS [SANDBOX]: IP {ip} is already blocked. Rule file: {rule_file}"
 
         entry = {
             "action": "block_ip",
@@ -525,11 +836,12 @@ def execute_quarantine_file_real(action: dict, token: str) -> str:
         reason = action["reason"]
         timestamp = str(datetime.datetime.now())
 
-        if not os.path.exists(path):
-            return "Error: File not found in quarantine sandbox."
-
         filename = os.path.basename(path)
         quarantine_path = os.path.join(QUARANTINE_DIR, f"{token}_{filename}")
+        if not os.path.exists(path):
+            if os.path.exists(quarantine_path):
+                return f"SUCCESS [SANDBOX]: File is already quarantined at {quarantine_path}"
+            return "Error: File not found in quarantine sandbox."
 
         shutil.move(path, quarantine_path)
 
@@ -578,6 +890,174 @@ def execute_quarantine_file_stub(action: dict, token: str) -> str:
     }
     log_action(entry)
     return f"SUCCESS [DRY RUN]: Quarantined file: {action['path']}. Reason: {action['reason']}"
+
+def execute_unblock_ip_real(action: dict, token: str) -> str:
+    """Execute real IP unblock by removing or deactivating firewall rule."""
+    import os
+    ip = action["ip"]
+    reason = action.get("reason", "")
+    rule_file = os.path.join(FIREWALL_SANDBOX_DIR, safe_ip_rule_filename(ip))
+    if os.path.exists(rule_file):
+        try:
+            os.remove(rule_file)
+        except Exception as exc:
+            return f"Error removing firewall rule: {exc}"
+    entry = {
+        "action": "unblock_ip",
+        "ip": ip,
+        "reason": reason,
+        "time": str(datetime.datetime.now()),
+        "status": "executed",
+        "token": token
+    }
+    log_action(entry)
+    return f"SUCCESS [SANDBOX]: Unblocked IP {ip}. Firewall rule removed. Reason: {reason}"
+
+
+def execute_unblock_ip_stub(action: dict, token: str) -> str:
+    """Execute stub unblock (dry-run mode)."""
+    entry = {
+        "action": "unblock_ip",
+        "ip": action["ip"],
+        "reason": action.get("reason", ""),
+        "time": str(datetime.datetime.now()),
+        "dry_run": True,
+        "status": "executed",
+        "token": token
+    }
+    log_action(entry)
+    return f"SUCCESS [DRY RUN]: Unblocked IP {action['ip']}. Reason: {action.get('reason', '')}"
+
+
+def execute_restore_quarantined_file_real(action: dict, token: str) -> str:
+    """Execute real file restore from quarantine sandbox."""
+    import shutil
+    raw_path = action.get("path", "")
+    path = _resolve_in_sandbox(raw_path)
+    if path is None:
+        _log_rejection("execute_restore_quarantined_file", "outside_quarantine_sandbox", target=raw_path)
+        return "Error: Restore target is outside quarantine sandbox."
+
+    filename = os.path.basename(path)
+    quarantine_candidate = None
+    metadata_candidate = None
+
+    if os.path.exists(QUARANTINE_DIR):
+        for fname in os.listdir(QUARANTINE_DIR):
+            if fname.endswith(".metadata"):
+                meta_p = os.path.join(QUARANTINE_DIR, fname)
+                try:
+                    with open(meta_p, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    meta_orig = meta.get("original_path", "")
+                    # Re-validate metadata destination against sandbox root
+                    if meta_orig:
+                        valid_meta_dest = _resolve_in_sandbox(meta_orig)
+                        if valid_meta_dest is None:
+                            _log_rejection("execute_restore_quarantined_file", "tampered_metadata_outside_sandbox", target=meta_orig)
+                            return f"Error: Quarantined metadata file '{fname}' points outside quarantine sandbox ({meta_orig}). Refusing restore."
+                    if os.path.normcase(os.path.realpath(meta_orig)) == os.path.normcase(os.path.realpath(path)):
+                        metadata_candidate = meta_p
+                        quarantine_candidate = meta.get("quarantined_path")
+                        break
+                except Exception:
+                    pass
+        if not quarantine_candidate:
+            for fname in os.listdir(QUARANTINE_DIR):
+                if not fname.endswith(".metadata") and (fname.endswith(f"_{filename}") or fname == filename):
+                    quarantine_candidate = os.path.join(QUARANTINE_DIR, fname)
+                    meta_p = quarantine_candidate + ".metadata"
+                    if os.path.exists(meta_p):
+                        metadata_candidate = meta_p
+                    break
+
+    if not quarantine_candidate or not os.path.exists(quarantine_candidate):
+        return f"Error: Quarantined file for {path} not found in quarantine store."
+
+    # Validate that quarantine_candidate is strictly inside QUARANTINE_DIR
+    real_quarantine_dir = os.path.realpath(QUARANTINE_DIR)
+    real_candidate = os.path.realpath(quarantine_candidate)
+    try:
+        if os.path.commonpath([real_quarantine_dir, real_candidate]) != real_quarantine_dir:
+            _log_rejection("execute_restore_quarantined_file", "tampered_quarantine_path", target=quarantine_candidate)
+            return "Error: Quarantined candidate file is outside quarantine directory."
+    except ValueError:
+        _log_rejection("execute_restore_quarantined_file", "tampered_quarantine_path", target=quarantine_candidate)
+        return "Error: Quarantined candidate file is outside quarantine directory."
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    shutil.move(quarantine_candidate, path)
+    if metadata_candidate and os.path.exists(metadata_candidate):
+        try:
+            os.remove(metadata_candidate)
+        except Exception:
+            pass
+
+    entry = {
+        "action": "restore_quarantined_file",
+        "path": path,
+        "restored_from": quarantine_candidate,
+        "reason": action.get("reason", ""),
+        "time": str(datetime.datetime.now()),
+        "status": "executed",
+        "token": token
+    }
+    log_action(entry)
+    return f"SUCCESS [SANDBOX]: Restored file to {path} from {quarantine_candidate}"
+
+
+def execute_restore_quarantined_file_stub(action: dict, token: str) -> str:
+    """Execute stub file restore (dry-run mode)."""
+    entry = {
+        "action": "restore_quarantined_file",
+        "path": action["path"],
+        "reason": action.get("reason", ""),
+        "time": str(datetime.datetime.now()),
+        "dry_run": True,
+        "status": "executed",
+        "token": token
+    }
+    log_action(entry)
+    return f"SUCCESS [DRY RUN]: Restored file: {action['path']}. Reason: {action.get('reason', '')}"
+
+
+def expire_active_blocks(ttl: Optional[float] = None) -> List[str]:
+    """Scan and expire active block rules whose TTL has elapsed, recording to the audit log."""
+    expired_ips = []
+    now = time.time()
+    if ttl is None:
+        try:
+            ttl = float(os.getenv("SENTINELOPS_BLOCK_TTL", 3600))
+        except ValueError:
+            ttl = 3600.0
+
+    if os.path.exists(FIREWALL_SANDBOX_DIR):
+        for fname in os.listdir(FIREWALL_SANDBOX_DIR):
+            if fname.startswith("block_") and fname.endswith(".rule"):
+                rule_path = os.path.join(FIREWALL_SANDBOX_DIR, fname)
+                try:
+                    with open(rule_path, "r", encoding="utf-8") as f:
+                        rule = json.load(f)
+                    created_at_str = rule.get("created_at")
+                    rule_ttl = float(rule.get("ttl", ttl))
+                    rule_time = datetime.datetime.fromisoformat(created_at_str).timestamp() if created_at_str else 0
+                    if rule_time > 0 and (now - rule_time) >= rule_ttl:
+                        ip = rule.get("ip")
+                        os.remove(rule_path)
+                        entry = {
+                            "action": "block_expired",
+                            "ip": ip,
+                            "reason": "TTL elapsed",
+                            "status": "expired",
+                            "time": str(datetime.datetime.now())
+                        }
+                        log_action(entry)
+                        if ip:
+                            expired_ips.append(ip)
+                except Exception:
+                    pass
+    return expired_ips
+
 
 @mcp.tool()
 def get_action_log() -> str:
@@ -643,8 +1123,18 @@ def check_ip_reputation_real(ip: str) -> str:
             
             # Generate result_token and store for validation
             result_token = str(uuid.uuid4())[:8]
+            session_id = os.getenv("SENTINELOPS_SESSION_ID", "default")
+            store.save_evidence(
+                token=result_token,
+                session_id=session_id,
+                ip=ip,
+                is_malicious=abuse_score > 50,
+                abuse_score=abuse_score
+            )
+            store.record_observed_ip(session_id, ip, source="check_ip_reputation")
             REPUTATION_RESULTS[result_token] = {
                 "token": result_token,
+                "session_id": session_id,
                 "ip": ip,
                 "abuse_score": abuse_score,
                 "is_malicious": abuse_score > 50,
@@ -722,8 +1212,18 @@ def check_ip_reputation_stub(ip: str) -> str:
     
     # Generate result_token and store for validation
     result_token = str(uuid.uuid4())[:8]
+    session_id = os.getenv("SENTINELOPS_SESSION_ID", "default")
+    store.save_evidence(
+        token=result_token,
+        session_id=session_id,
+        ip=ip,
+        is_malicious=result.get("is_malicious", False),
+        abuse_score=result.get("abuse_score", -1)
+    )
+    store.record_observed_ip(session_id, ip, source="check_ip_reputation")
     REPUTATION_RESULTS[result_token] = {
         "token": result_token,
+        "session_id": session_id,
         "ip": ip,
         "abuse_score": result.get("abuse_score", -1),
         "is_malicious": result.get("is_malicious", False),
@@ -758,17 +1258,18 @@ def check_ip_reputation(ip: str) -> str:
 INCIDENTS_FILE = "incidents.json"
 VALID_SEVERITIES = ["low", "medium", "high", "critical"]
 
+
 def load_incidents():
     """Load incidents from JSON file."""
     try:
-        with open(INCIDENTS_FILE, 'r') as f:
+        with open(INCIDENTS_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 def save_incidents(incidents):
     """Save incidents to JSON file."""
-    with open(INCIDENTS_FILE, 'w') as f:
+    with open(INCIDENTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(incidents, f, indent=2)
 
 @mcp.tool()
@@ -818,7 +1319,13 @@ def create_incident(summary: str, severity: str, related_ip: str = None, evidenc
                 "reason": "Cannot create high-severity incident without validated evidence"
             })
 
-        if evidence_token not in REPUTATION_RESULTS:
+        evidence = REPUTATION_RESULTS.get(evidence_token)
+        if not evidence:
+            ev = store.get_evidence(evidence_token)
+            if ev and ev.get("expires_at", 0) > time.time():
+                evidence = ev
+
+        if not evidence:
             _log_rejection("create_incident", "unknown_evidence_token")
             return json.dumps({
                 "error": "REJECTED: Invalid evidence_token (not found or expired)",
@@ -884,7 +1391,7 @@ def list_incidents() -> str:
 # Phase 5: Telegram notification system
 
 @mcp.tool()
-def debug_seed_pending_action(token: str, action_type: str, ip: str = None, path: str = None, reason: str = "Test action", status: str = "pending") -> str:
+def debug_seed_pending_action(token: str, action_type: str, ip: str = None, path: str = None, reason: str = "Test action", status: str = "pending", session_id: str = None) -> str:
     """DEBUG TOOL: Manually seed a pending action for testing.
     This bypasses propose_* tools to directly create test tokens.
 
@@ -893,7 +1400,7 @@ def debug_seed_pending_action(token: str, action_type: str, ip: str = None, path
     if not ENABLE_DEBUG_ENDPOINTS:
         return "Error: Debug endpoints are disabled. Set ENABLE_DEBUG_ENDPOINTS=true to enable."
 
-    actions = load_pending_actions()
+    session = session_id or os.getenv("SENTINELOPS_SESSION_ID", "default")
     if action_type == "block_ip":
         if not ip:
             return "Error: ip is required for block_ip action_type"
@@ -902,31 +1409,32 @@ def debug_seed_pending_action(token: str, action_type: str, ip: str = None, path
         except ValueError as exc:
             _log_rejection("debug_seed_pending_action", "invalid_block_ip")
             return f"Error: Invalid IP address '{ip}'. {exc}"
-        actions[token] = {
-            "action_type": "block_ip",
-            "ip": validated_ip,
-            "reason": reason,
-            "status": status,
-            "created_at": str(datetime.datetime.now()),
-            "debug_seed": True
-        }
-        PENDING_ACTIONS.clear(); PENDING_ACTIONS.update(actions)
-        save_pending_actions(actions)
+        
+        params = {"ip": validated_ip, "reason": reason}
+        store.create_action(token, session, "block_ip", params, status="pending")
+        if status != "pending":
+            if status in ("confirmed", "declined", "expired"):
+                store.transition(token, session, "pending", status)
+            elif status in ("executing", "executed", "failed"):
+                store.transition(token, session, "pending", "confirmed")
+                store.transition(token, session, "confirmed", "executing")
+                if status in ("executed", "failed"):
+                    store.transition(token, session, "executing", status)
         return f"DEBUG: Seeded pending action with token '{token}' (block_ip: {validated_ip}, status: {status})"
 
     elif action_type == "quarantine_file":
         if not path:
             return "Error: path is required for quarantine_file action_type"
-        actions[token] = {
-            "action_type": "quarantine_file",
-            "path": path,
-            "reason": reason,
-            "status": status,
-            "created_at": str(datetime.datetime.now()),
-            "debug_seed": True
-        }
-        PENDING_ACTIONS.clear(); PENDING_ACTIONS.update(actions)
-        save_pending_actions(actions)
+        params = {"path": path, "reason": reason}
+        store.create_action(token, session, "quarantine_file", params, status="pending")
+        if status != "pending":
+            if status in ("confirmed", "declined", "expired"):
+                store.transition(token, session, "pending", status)
+            elif status in ("executing", "executed", "failed"):
+                store.transition(token, session, "pending", "confirmed")
+                store.transition(token, session, "confirmed", "executing")
+                if status in ("executed", "failed"):
+                    store.transition(token, session, "executing", status)
         return f"DEBUG: Seeded pending action with token '{token}' (quarantine_file: {path}, status: {status})"
 
     else:
@@ -962,7 +1470,13 @@ def notify_telegram(message: str, evidence_token: str = None) -> str:
                 "reason": "Cannot send threat notification without validated evidence"
             })
 
-        if evidence_token not in REPUTATION_RESULTS:
+        evidence = REPUTATION_RESULTS.get(evidence_token)
+        if not evidence:
+            ev = store.get_evidence(evidence_token)
+            if ev and ev.get("expires_at", 0) > time.time():
+                evidence = ev
+
+        if not evidence:
             _log_rejection("notify_telegram", "unknown_evidence_token")
             return json.dumps({
                 "error": "REJECTED: Invalid evidence_token (not found or expired)",
@@ -1034,6 +1548,14 @@ def notify_telegram(message: str, evidence_token: str = None) -> str:
 
 if __name__ == "__main__":
     import sys
+    
+    # CRITICAL FIX: Force UTF-8 encoding for stdout/stderr on Windows
+    # This prevents UnicodeEncodeError when MCP responses contain Unicode characters
+    # Use reconfigure() instead of detach() to avoid closing the streams
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    
     sys.stderr.write("="*60 + "\n")
     sys.stderr.write("SentinelOps MCP Server Starting\n")
     sys.stderr.write("="*60 + "\n")

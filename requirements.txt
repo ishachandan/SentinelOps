@@ -7,9 +7,6 @@ requests==2.32.3
 # MCP (Model Context Protocol) - using latest 1.x version
 mcp==1.29.0
 
-# Database for ChromaDB (vector storage)
-chromadb==0.6.2
-
 # Testing (optional, for development)
 pytest==8.3.4
 pytest-asyncio==0.25.2
